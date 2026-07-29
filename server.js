@@ -1,15 +1,176 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
+const net = require('net');
 const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
 
 const app = express();
 const port = process.env.PORT || 3000;
+const isProduction = process.env.NODE_ENV === 'production';
 
 // 中间件
-app.use(cors());
-app.use(express.json());
+app.set('trust proxy', 1);
+
+const configuredOrigins = (process.env.FRONTEND_ORIGIN || '')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+const developmentOrigins = [
+  'http://localhost:3000',
+  'http://localhost:4173',
+  'http://localhost:5173',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:4173',
+  'http://127.0.0.1:5173'
+];
+const allowedOrigins = new Set([
+  ...configuredOrigins,
+  ...(isProduction ? [] : developmentOrigins)
+]);
+
+app.use(cors({
+  origin(origin, callback) {
+    // 无 Origin 的服务端请求不受浏览器 CORS 限制，仍由接口自身鉴权。
+    if (!origin || allowedOrigins.has(origin)) {
+      return callback(null, true);
+    }
+    const error = new Error('不允许的跨域来源');
+    error.code = 'CORS_NOT_ALLOWED';
+    return callback(error);
+  }
+}));
+app.use(express.json({ limit: '64kb' }));
+
+// ---------- 管理员验证 ----------
+function secureTokenEquals(candidate, expected) {
+  if (typeof candidate !== 'string' || typeof expected !== 'string') return false;
+  const candidateBuffer = Buffer.from(candidate);
+  const expectedBuffer = Buffer.from(expected);
+  return candidateBuffer.length === expectedBuffer.length
+    && crypto.timingSafeEqual(candidateBuffer, expectedBuffer);
+}
+
+function requireAdmin(req, res, next) {
+  const adminToken = process.env.ADMIN_TOKEN;
+  if (!adminToken) {
+    console.error('管理员接口不可用：未配置 ADMIN_TOKEN');
+    return res.status(503).json({ error: '管理员功能未配置' });
+  }
+
+  const authorization = req.get('authorization') || '';
+  const bearerToken = authorization.startsWith('Bearer ')
+    ? authorization.slice(7).trim()
+    : '';
+  const candidate = bearerToken || req.get('x-admin-token') || req.body?.token;
+
+  if (!secureTokenEquals(candidate, adminToken)) {
+    return res.status(401).json({ error: '管理员验证失败' });
+  }
+  return next();
+}
+
+// ---------- 外部 AI 地址验证 ----------
+function isPrivateHostname(hostname) {
+  const normalized = hostname.toLowerCase();
+  if (normalized === 'localhost' || normalized.endsWith('.localhost')) return true;
+
+  const ipVersion = net.isIP(normalized);
+  if (ipVersion === 4) {
+    const parts = normalized.split('.').map(Number);
+    return parts[0] === 10
+      || parts[0] === 127
+      || (parts[0] === 169 && parts[1] === 254)
+      || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31)
+      || (parts[0] === 192 && parts[1] === 168);
+  }
+  if (ipVersion === 6) {
+    return normalized === '::1'
+      || normalized.startsWith('fc')
+      || normalized.startsWith('fd')
+      || normalized.startsWith('fe8')
+      || normalized.startsWith('fe9')
+      || normalized.startsWith('fea')
+      || normalized.startsWith('feb');
+  }
+  return false;
+}
+
+function validateBaseUrl(value) {
+  if (typeof value !== 'string' || !value.trim()) {
+    return { valid: false, error: 'base_url 不能为空' };
+  }
+
+  try {
+    const url = new URL(value);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+      return { valid: false, error: 'base_url 格式无效' };
+    }
+    if (isProduction && (url.protocol !== 'https:' || isPrivateHostname(url.hostname))) {
+      return { valid: false, error: '生产环境只允许公开的 HTTPS 地址' };
+    }
+
+    const allowlist = (process.env.AI_BASE_URL_ALLOWLIST || '')
+      .split(',')
+      .map(item => item.trim())
+      .filter(Boolean);
+    if (allowlist.length > 0) {
+      const allowed = allowlist.some(item => {
+        try {
+          return new URL(item).origin === url.origin;
+        } catch {
+          return false;
+        }
+      });
+      if (!allowed) {
+        return { valid: false, error: 'base_url 不在允许列表中' };
+      }
+    }
+    return { valid: true, url };
+  } catch {
+    return { valid: false, error: 'base_url 格式无效' };
+  }
+}
+
+// ---------- 对话频率限制 ----------
+function positiveInteger(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const chatRateLimitWindowMs = positiveInteger(process.env.CHAT_RATE_LIMIT_WINDOW_MS, 60_000);
+const chatRateLimitMax = positiveInteger(process.env.CHAT_RATE_LIMIT_MAX, 20);
+const chatMaxMessageLength = positiveInteger(process.env.CHAT_MAX_MESSAGE_LENGTH, 4_000);
+const chatRateLimits = new Map();
+
+function chatRateLimit(req, res, next) {
+  const now = Date.now();
+  const key = req.ip || req.socket.remoteAddress || 'unknown';
+  let entry = chatRateLimits.get(key);
+
+  if (!entry || now >= entry.resetAt) {
+    entry = { count: 0, resetAt: now + chatRateLimitWindowMs };
+  }
+  entry.count += 1;
+  chatRateLimits.set(key, entry);
+
+  if (chatRateLimits.size > 10_000) {
+    for (const [storedKey, storedEntry] of chatRateLimits) {
+      if (now >= storedEntry.resetAt) chatRateLimits.delete(storedKey);
+    }
+  }
+
+  res.set('RateLimit-Limit', String(chatRateLimitMax));
+  res.set('RateLimit-Remaining', String(Math.max(0, chatRateLimitMax - entry.count)));
+  res.set('RateLimit-Reset', String(Math.ceil(entry.resetAt / 1000)));
+
+  if (entry.count > chatRateLimitMax) {
+    res.set('Retry-After', String(Math.ceil((entry.resetAt - now) / 1000)));
+    return res.status(429).json({ error: '请求过于频繁，请稍后再试' });
+  }
+  return next();
+}
 
 // 初始化 Supabase 客户端
 const supabase = createClient(
@@ -184,63 +345,91 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'cc-home 后端运行中（已接入 Ombre Brain）' });
 });
 
-// ---------- 测试数据库连接 ----------
-app.get('/test-db', async (req, res) => {
+// ---------- 测试数据库连接（仅管理员） ----------
+app.get('/test-db', requireAdmin, async (req, res) => {
   try {
-    const { data, error } = await supabase.from('settings').select('*');
+    const { error } = await supabase
+      .from('settings')
+      .select('id', { head: true, count: 'exact' })
+      .limit(1);
     if (error) throw error;
-    res.json({ success: true, data });
+    res.json({ connected: true });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    console.error('数据库连接测试失败:', err.message);
+    res.status(503).json({ connected: false });
   }
 });
 
-// ---------- 测试 Ombre Brain 连接 ----------
-app.get('/test-ombre', async (req, res) => {
-  const result = await callOmbreTool('breath', { query: '测试' });
-  res.json({ connected: !!result, result });
+// ---------- 测试 Ombre Brain 连接（仅管理员，不读取记忆） ----------
+app.get('/test-ombre', requireAdmin, async (req, res) => {
+  const connected = await initOmbreSession();
+  res.status(connected ? 200 : 503).json({ connected });
 });
 
-// ---------- 获取模型列表（从给定的 base_url 和 api_key） ----------
-app.post('/models', async (req, res) => {
+// ---------- 获取模型列表（仅管理员） ----------
+app.post('/models', requireAdmin, async (req, res) => {
   const { base_url, api_key } = req.body;
-  if (!base_url || !api_key) {
+  if (typeof base_url !== 'string' || typeof api_key !== 'string' || !base_url || !api_key) {
     return res.status(400).json({ error: '缺少 base_url 或 api_key' });
+  }
+
+  const validation = validateBaseUrl(base_url);
+  if (!validation.valid) {
+    return res.status(400).json({ error: validation.error });
   }
 
   try {
     // 拼接 /models 接口（OpenAI 兼容标准）
-    const url = base_url.endsWith('/') ? `${base_url}models` : `${base_url}/models`;
+    const normalizedBaseUrl = validation.url.toString();
+    const url = normalizedBaseUrl.endsWith('/')
+      ? `${normalizedBaseUrl}models`
+      : `${normalizedBaseUrl}/models`;
     const response = await axios.get(url, {
       headers: {
         'Authorization': `Bearer ${api_key}`
-      }
+      },
+      timeout: 15_000,
+      maxRedirects: 0
     });
 
     // 标准返回格式：{ data: [ { id: 'model-name', ... }, ... ] }
     const models = response.data?.data?.map(m => m.id) || [];
     res.json({ success: true, models });
   } catch (err) {
-    console.error('获取模型列表失败:', err.message);
-    res.status(500).json({ 
-      success: false, 
-      error: err.response?.data?.error?.message || err.message 
+    console.error('获取模型列表失败:', {
+      message: err.message,
+      status: err.response?.status
+    });
+    res.status(502).json({
+      success: false,
+      error: '无法获取模型列表'
     });
   }
 });
 
 // ---------- 更新 AI 配置（需要管理员 token） ----------
-app.post('/admin/config', async (req, res) => {
-  const { token, base_url, api_key, model_name } = req.body;
-  const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
-  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) {
-    return res.status(401).json({ error: '无效的 token' });
+app.post('/admin/config', requireAdmin, async (req, res) => {
+  const { base_url, api_key, model_name } = req.body;
+
+  if (api_key !== undefined && typeof api_key !== 'string') {
+    return res.status(400).json({ error: 'api_key 格式无效' });
+  }
+  if (model_name !== undefined && typeof model_name !== 'string') {
+    return res.status(400).json({ error: 'model_name 格式无效' });
+  }
+
+  let validatedBaseUrl;
+  if (base_url !== undefined) {
+    validatedBaseUrl = validateBaseUrl(base_url);
+    if (!validatedBaseUrl.valid) {
+      return res.status(400).json({ error: validatedBaseUrl.error });
+    }
   }
 
   try {
     // 只更新提供的字段，缺失则不更新
     const updates = {};
-    if (base_url !== undefined) updates.base_url = base_url;
+    if (validatedBaseUrl) updates.base_url = validatedBaseUrl.url.toString();
     if (api_key !== undefined) updates.api_key = api_key;
     if (model_name !== undefined) updates.model_name = model_name;
     updates.updated_at = new Date();
@@ -253,15 +442,21 @@ app.post('/admin/config', async (req, res) => {
     if (error) throw error;
     res.json({ success: true, message: '配置已更新，下次对话生效' });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    console.error('更新 AI 配置失败:', err.message);
+    res.status(500).json({ success: false, error: '配置更新失败' });
   }
 });
 
 // ---------- 对话接口（已接入记忆，并从数据库读取 AI 配置） ----------
-app.post('/chat', async (req, res) => {
+app.post('/chat', chatRateLimit, async (req, res) => {
   const { message, sessionId } = req.body;
-  if (!message) {
+  if (typeof message !== 'string' || !message.trim()) {
     return res.status(400).json({ error: '消息内容不能为空' });
+  }
+  if (message.length > chatMaxMessageLength) {
+    return res.status(413).json({
+      error: `消息内容不能超过 ${chatMaxMessageLength} 个字符`
+    });
   }
 
   const finalSessionId = sessionId || Date.now();
@@ -331,8 +526,7 @@ ${memories || '（这是我们的第一次对话，还没有共同记忆。）'}
       });
 
       if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`AI API 错误: ${response.status} ${errText}`);
+        throw new Error(`AI API 请求失败，状态码: ${response.status}`);
       }
 
       const data = await response.json();
@@ -361,12 +555,24 @@ ${memories || '（这是我们的第一次对话，还没有共同记忆。）'}
     res.json({ reply });
 
   } catch (error) {
-    console.error('/chat 接口错误:', error);
+    console.error('/chat 接口错误:', error.message);
     res.status(500).json({
       error: '服务器内部错误',
       reply: '抱歉，我现在有点不在状态，请稍后再试试。'
     });
   }
+});
+
+// ---------- 统一错误响应 ----------
+app.use((error, req, res, next) => {
+  if (error.code === 'CORS_NOT_ALLOWED') {
+    return res.status(403).json({ error: '不允许的跨域来源' });
+  }
+  if (error.type === 'entity.too.large') {
+    return res.status(413).json({ error: '请求内容过大' });
+  }
+  console.error('未处理的请求错误:', error.message);
+  return res.status(500).json({ error: '服务器内部错误' });
 });
 
 // ---------- 启动服务器 ----------
