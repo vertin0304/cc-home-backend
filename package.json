@@ -2,9 +2,11 @@
   "name": "cc-home-backend",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js",
+    "check": "node --check server.js && node --check test/server.test.js",
+    "test": "node --test test/server.test.js"
   },
   "keywords": [],
   "author": "",
@@ -12,7 +14,6 @@
   "type": "commonjs",
   "dependencies": {
     "@supabase/supabase-js": "^2.110.0",
-    "axios": "^1.18.1",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1"

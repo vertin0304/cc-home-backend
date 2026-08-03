@@ -1,388 +1,495 @@
 require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
+const net = require('net');
 const { createClient } = require('@supabase/supabase-js');
-const axios = require('axios');
 
-const app = express();
-const port = process.env.PORT || 3000;
+function positiveInteger(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
 
-// 中间件
-app.use(cors());
-app.use(express.json());
+function secureTokenEquals(candidate, expected) {
+  if (typeof candidate !== 'string' || typeof expected !== 'string') return false;
+  const candidateBuffer = Buffer.from(candidate);
+  const expectedBuffer = Buffer.from(expected);
+  return candidateBuffer.length === expectedBuffer.length
+    && crypto.timingSafeEqual(candidateBuffer, expectedBuffer);
+}
 
-// 初始化 Supabase 客户端
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
-);
+function isPrivateHostname(hostname) {
+  const normalized = hostname.toLowerCase();
+  if (normalized === 'localhost' || normalized.endsWith('.localhost')) return true;
 
-// ---------- Ombre Brain MCP 连接配置 ----------
-const OMBRE_BRAIN_URL = process.env.OMBRE_BRAIN_URL || 'https://cc-home.zeabur.app';
-let ombreSessionId = null;
-let ombreCallId = 0;
-
-// ---------- SSE 响应解析器 ----------
-function parseSSEResponse(text) {
-  const lines = text.split('\n');
-  for (const line of lines) {
-    if (line.startsWith('data: ')) {
-      try {
-        return JSON.parse(line.substring(6));
-      } catch (e) { /* ignore */ }
-    }
+  const ipVersion = net.isIP(normalized);
+  if (ipVersion === 4) {
+    const parts = normalized.split('.').map(Number);
+    return parts[0] === 10
+      || parts[0] === 127
+      || (parts[0] === 169 && parts[1] === 254)
+      || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31)
+      || (parts[0] === 192 && parts[1] === 168);
   }
+  if (ipVersion === 6) {
+    return normalized === '::1'
+      || normalized.startsWith('fc')
+      || normalized.startsWith('fd')
+      || normalized.startsWith('fe8')
+      || normalized.startsWith('fe9')
+      || normalized.startsWith('fea')
+      || normalized.startsWith('feb');
+  }
+  return false;
+}
+
+// ---------- Gateway 地址验证 ----------
+function validateGatewayBaseUrl(value, isProduction = false) {
+  if (typeof value !== 'string' || !value.trim()) {
+    return { valid: false, error: 'Gateway 地址未配置' };
+  }
+
   try {
-    return JSON.parse(text);
-  } catch (e) {
+    const url = new URL(value);
+    if (
+      !['http:', 'https:'].includes(url.protocol)
+      || url.username
+      || url.password
+      || url.search
+      || url.hash
+    ) {
+      return { valid: false, error: 'Gateway 地址格式无效' };
+    }
+    if (isProduction && (url.protocol !== 'https:' || isPrivateHostname(url.hostname))) {
+      return { valid: false, error: '生产环境只允许公开的 HTTPS Gateway 地址' };
+    }
+    return { valid: true, url };
+  } catch {
+    return { valid: false, error: 'Gateway 地址格式无效' };
+  }
+}
+
+function normalizeSessionId(value, fallback) {
+  let candidate = value;
+  if (candidate === undefined || candidate === null || candidate === '') {
+    candidate = fallback;
+  }
+  if (typeof candidate !== 'string' && typeof candidate !== 'number') {
     return null;
   }
-}
 
-// ---------- MCP 会话初始化 ----------
-async function initOmbreSession() {
-  try {
-    const response = await axios.post(
-      `${OMBRE_BRAIN_URL}/mcp`,
-      {
-        jsonrpc: "2.0",
-        method: "initialize",
-        params: {
-          protocolVersion: "2024-11-05",
-          capabilities: {},
-          clientInfo: { name: "cc-home-backend", version: "1.0" }
-        },
-        id: ++ombreCallId
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json, text/event-stream'
-        }
-      }
-    );
-
-    if (response.headers['mcp-session-id']) {
-      ombreSessionId = response.headers['mcp-session-id'];
-    } else {
-      const parsed = parseSSEResponse(response.data);
-      if (parsed?.result?.sessionId) {
-        ombreSessionId = parsed.result.sessionId;
-      }
-    }
-
-    if (!ombreSessionId) {
-      console.error('❌ 无法获取 MCP session ID');
-      return false;
-    }
-
-    await axios.post(
-      `${OMBRE_BRAIN_URL}/mcp`,
-      {
-        jsonrpc: "2.0",
-        method: "notifications/initialized"
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json, text/event-stream',
-          'Mcp-Session-Id': ombreSessionId
-        }
-      }
-    );
-
-    console.log('✅ Ombre Brain MCP 会话已建立');
-    return true;
-  } catch (err) {
-    console.error('❌ MCP 会话初始化失败:', err.message);
-    ombreSessionId = null;
-    return false;
-  }
-}
-
-// ---------- 调用 Ombre Brain 工具 ----------
-async function callOmbreTool(toolName, args = {}) {
-  if (!OMBRE_BRAIN_URL) return null;
-
-  try {
-    if (!ombreSessionId) {
-      const ok = await initOmbreSession();
-      if (!ok) return null;
-    }
-
-    const response = await axios.post(
-      `${OMBRE_BRAIN_URL}/mcp`,
-      {
-        jsonrpc: "2.0",
-        method: "tools/call",
-        params: {
-          name: toolName,
-          arguments: args
-        },
-        id: ++ombreCallId
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json, text/event-stream',
-          'Mcp-Session-Id': ombreSessionId
-        },
-        transformResponse: [(data) => data]
-      }
-    );
-
-    const parsed = parseSSEResponse(response.data);
-    if (parsed?.result?.content) {
-      return parsed.result.content
-        .filter(c => c.type === 'text')
-        .map(c => c.text)
-        .join('\n');
-    }
-    return parsed ? JSON.stringify(parsed) : null;
-  } catch (err) {
-    console.error(`❌ MCP 工具 ${toolName} 调用失败:`, err.message);
+  const normalized = String(candidate).trim();
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(normalized)) {
     return null;
   }
+  return normalized;
 }
 
-// ---------- 从数据库读取 AI 配置（如果数据库有值则使用，否则 fallback 到环境变量） ----------
-async function getAIConfig() {
-  try {
-    const { data, error } = await supabase
-      .from('settings')
-      .select('base_url, api_key, model_name')
-      .eq('id', 1)
-      .single();
+function normalizeHistory(history) {
+  const roleMap = {
+    user: 'user',
+    ai: 'assistant',
+    assistant: 'assistant'
+  };
 
-    if (error || !data) {
-      // 如果数据库没有记录，返回环境变量
-      return {
-        base_url: process.env.BASE_URL,
-        api_key: process.env.API_KEY,
-        model_name: process.env.MODEL_NAME
-      };
+  return (Array.isArray(history) ? history : [])
+    .slice()
+    .reverse()
+    .filter(item => item && roleMap[item.role] && typeof item.content === 'string')
+    .map(item => ({ role: roleMap[item.role], content: item.content }));
+}
+
+function createApp(options = {}) {
+  const env = options.env || process.env;
+  const isProduction = env.NODE_ENV === 'production';
+  const gatewayFetch = options.gatewayFetch || global.fetch;
+  const supabase = options.supabaseClient || createClient(
+    env.SUPABASE_URL,
+    env.SUPABASE_KEY
+  );
+
+  if (typeof gatewayFetch !== 'function') {
+    throw new Error('当前 Node.js 环境不支持 fetch');
+  }
+
+  const app = express();
+  app.set('trust proxy', 1);
+
+  // ---------- CORS 与请求体限制 ----------
+  const configuredOrigins = (env.FRONTEND_ORIGIN || '')
+    .split(',')
+    .map(origin => origin.trim())
+    .filter(Boolean);
+  const developmentOrigins = [
+    'http://localhost:3000',
+    'http://localhost:4173',
+    'http://localhost:5173',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:4173',
+    'http://127.0.0.1:5173'
+  ];
+  const allowedOrigins = new Set([
+    ...configuredOrigins,
+    ...(isProduction ? [] : developmentOrigins)
+  ]);
+
+  app.use(cors({
+    origin(origin, callback) {
+      // 无 Origin 的服务端请求仍由接口自身鉴权。
+      if (!origin || allowedOrigins.has(origin)) {
+        return callback(null, true);
+      }
+      const error = new Error('不允许的跨域来源');
+      error.code = 'CORS_NOT_ALLOWED';
+      return callback(error);
+    }
+  }));
+  app.use(express.json({ limit: '64kb' }));
+
+  // ---------- 管理员验证 ----------
+  function requireAdmin(req, res, next) {
+    const adminToken = env.ADMIN_TOKEN;
+    if (!adminToken) {
+      console.error('管理员接口不可用：未配置 ADMIN_TOKEN');
+      return res.status(503).json({ error: '管理员功能未配置' });
     }
 
-    // 数据库有值，使用数据库，但若某个字段为空则 fallback 到环境变量
-    return {
-      base_url: data.base_url || process.env.BASE_URL,
-      api_key: data.api_key || process.env.API_KEY,
-      model_name: data.model_name || process.env.MODEL_NAME
-    };
-  } catch (e) {
-    console.warn('读取数据库配置失败，使用环境变量:', e.message);
-    return {
-      base_url: process.env.BASE_URL,
-      api_key: process.env.API_KEY,
-      model_name: process.env.MODEL_NAME
-    };
-  }
-}
+    const authorization = req.get('authorization') || '';
+    const bearerToken = authorization.startsWith('Bearer ')
+      ? authorization.slice(7).trim()
+      : '';
+    const candidate = bearerToken || req.get('x-admin-token');
 
-// ---------- 健康检查 ----------
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', message: 'cc-home 后端运行中（已接入 Ombre Brain）' });
-});
-
-// ---------- 测试数据库连接 ----------
-app.get('/test-db', async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('settings').select('*');
-    if (error) throw error;
-    res.json({ success: true, data });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ---------- 测试 Ombre Brain 连接 ----------
-app.get('/test-ombre', async (req, res) => {
-  const result = await callOmbreTool('breath', { query: '测试' });
-  res.json({ connected: !!result, result });
-});
-
-// ---------- 获取模型列表（从给定的 base_url 和 api_key） ----------
-app.post('/models', async (req, res) => {
-  const { base_url, api_key } = req.body;
-  if (!base_url || !api_key) {
-    return res.status(400).json({ error: '缺少 base_url 或 api_key' });
+    if (!secureTokenEquals(candidate, adminToken)) {
+      return res.status(401).json({ error: '管理员验证失败' });
+    }
+    return next();
   }
 
-  try {
-    // 拼接 /models 接口（OpenAI 兼容标准）
-    const url = base_url.endsWith('/') ? `${base_url}models` : `${base_url}/models`;
-    const response = await axios.get(url, {
-      headers: {
-        'Authorization': `Bearer ${api_key}`
+  // ---------- 生产环境聊天访问验证 ----------
+  function requireChatAccess(req, res, next) {
+    if (!isProduction) return next();
+
+    const chatAccessToken = env.CHAT_ACCESS_TOKEN;
+    if (!chatAccessToken) {
+      console.error('聊天接口不可用：未配置 CHAT_ACCESS_TOKEN');
+      return res.status(503).json({ error: '聊天访问功能未配置' });
+    }
+
+    const authorization = req.get('authorization') || '';
+    const bearerToken = authorization.startsWith('Bearer ')
+      ? authorization.slice(7).trim()
+      : '';
+
+    if (!secureTokenEquals(bearerToken, chatAccessToken)) {
+      return res.status(401).json({ error: '聊天访问验证失败' });
+    }
+    return next();
+  }
+
+  // ---------- /chat 基础频率限制 ----------
+  const chatRateLimitWindowMs = positiveInteger(env.CHAT_RATE_LIMIT_WINDOW_MS, 60_000);
+  const chatRateLimitMax = positiveInteger(env.CHAT_RATE_LIMIT_MAX, 20);
+  const chatMaxMessageLength = positiveInteger(env.CHAT_MAX_MESSAGE_LENGTH, 4_000);
+  const chatRateLimits = new Map();
+
+  function chatRateLimit(req, res, next) {
+    const now = Date.now();
+    const key = req.ip || req.socket.remoteAddress || 'unknown';
+    let entry = chatRateLimits.get(key);
+
+    if (!entry || now >= entry.resetAt) {
+      entry = { count: 0, resetAt: now + chatRateLimitWindowMs };
+    }
+    entry.count += 1;
+    chatRateLimits.set(key, entry);
+
+    if (chatRateLimits.size > 10_000) {
+      for (const [storedKey, storedEntry] of chatRateLimits) {
+        if (now >= storedEntry.resetAt) chatRateLimits.delete(storedKey);
       }
-    });
+    }
 
-    // 标准返回格式：{ data: [ { id: 'model-name', ... }, ... ] }
-    const models = response.data?.data?.map(m => m.id) || [];
-    res.json({ success: true, models });
-  } catch (err) {
-    console.error('获取模型列表失败:', err.message);
-    res.status(500).json({ 
-      success: false, 
-      error: err.response?.data?.error?.message || err.message 
-    });
-  }
-});
+    res.set('RateLimit-Limit', String(chatRateLimitMax));
+    res.set('RateLimit-Remaining', String(Math.max(0, chatRateLimitMax - entry.count)));
+    res.set('RateLimit-Reset', String(Math.ceil(entry.resetAt / 1000)));
 
-// ---------- 更新 AI 配置（需要管理员 token） ----------
-app.post('/admin/config', async (req, res) => {
-  const { token, base_url, api_key, model_name } = req.body;
-  const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
-  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) {
-    return res.status(401).json({ error: '无效的 token' });
+    if (entry.count > chatRateLimitMax) {
+      res.set('Retry-After', String(Math.ceil((entry.resetAt - now) / 1000)));
+      return res.status(429).json({ error: '请求过于频繁，请稍后再试' });
+    }
+    return next();
   }
 
-  try {
-    // 只更新提供的字段，缺失则不更新
-    const updates = {};
-    if (base_url !== undefined) updates.base_url = base_url;
-    if (api_key !== undefined) updates.api_key = api_key;
-    if (model_name !== undefined) updates.model_name = model_name;
-    updates.updated_at = new Date();
-
-    const { error } = await supabase
-      .from('settings')
-      .update(updates)
-      .eq('id', 1);
-
-    if (error) throw error;
-    res.json({ success: true, message: '配置已更新，下次对话生效' });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ---------- 对话接口（已接入记忆，并从数据库读取 AI 配置） ----------
-app.post('/chat', async (req, res) => {
-  const { message, sessionId } = req.body;
-  if (!message) {
-    return res.status(400).json({ error: '消息内容不能为空' });
+  function gatewayConnectionConfig() {
+    const validation = validateGatewayBaseUrl(env.OMBRE_GATEWAY_BASE_URL, isProduction);
+    if (!validation.valid) {
+      const error = new Error(validation.error);
+      error.code = 'GATEWAY_CONFIG_ERROR';
+      throw error;
+    }
+    if (typeof env.OMBRE_GATEWAY_TOKEN !== 'string' || !env.OMBRE_GATEWAY_TOKEN.trim()) {
+      const error = new Error('Gateway token 未配置');
+      error.code = 'GATEWAY_CONFIG_ERROR';
+      throw error;
+    }
+    return {
+      baseUrl: validation.url.toString().replace(/\/+$/, ''),
+      token: env.OMBRE_GATEWAY_TOKEN.trim(),
+      timeoutMs: positiveInteger(env.OMBRE_GATEWAY_TIMEOUT_MS, 30_000)
+    };
   }
 
-  const finalSessionId = sessionId || Date.now();
+  function gatewayChatConfig() {
+    const config = gatewayConnectionConfig();
+    if (typeof env.OMBRE_GATEWAY_MODEL !== 'string' || !env.OMBRE_GATEWAY_MODEL.trim()) {
+      const error = new Error('Gateway 模型未配置');
+      error.code = 'GATEWAY_CONFIG_ERROR';
+      throw error;
+    }
+    return { ...config, model: env.OMBRE_GATEWAY_MODEL.trim() };
+  }
 
-  try {
-    // 1. 从数据库读取 AI 配置
-    const config = await getAIConfig();
-    const { base_url, api_key, model_name } = config;
+  async function requestGateway(path, requestOptions = {}) {
+    const config = gatewayConnectionConfig();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), config.timeoutMs);
 
-    // 2. 从 Ombre Brain 检索相关记忆
-    let memories = '';
     try {
-      const memoryResult = await callOmbreTool('breath', { query: message });
-      if (memoryResult) {
-        memories = memoryResult;
-        console.log('🧠 检索到相关记忆:', memories.substring(0, 100) + '...');
+      return await gatewayFetch(`${config.baseUrl}${path}`, {
+        ...requestOptions,
+        headers: {
+          Authorization: `Bearer ${config.token}`,
+          ...(requestOptions.headers || {})
+        },
+        redirect: 'error',
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  // ---------- 被动健康检查 ----------
+  app.get('/health', (req, res) => {
+    res.json({ status: 'ok', message: 'cc-home 后端运行中（Gateway 模式）' });
+  });
+
+  // ---------- 测试数据库连接（仅管理员，不返回数据） ----------
+  app.get('/test-db', requireAdmin, async (req, res) => {
+    try {
+      const { error } = await supabase
+        .from('messages')
+        .select('session_id', { head: true, count: 'exact' })
+        .limit(1);
+      if (error) throw error;
+      return res.json({ connected: true });
+    } catch (error) {
+      console.error('数据库连接测试失败:', error.message);
+      return res.status(503).json({ connected: false });
+    }
+  });
+
+  async function testGatewayConnection(req, res) {
+    try {
+      const response = await requestGateway('/models', { method: 'GET' });
+      if (!response.ok) {
+        console.error('Gateway 连接测试失败:', { status: response.status });
+        return res.status(503).json({ connected: false });
       }
-    } catch (memErr) {
-      console.warn('⚠️ 记忆检索失败（继续对话）:', memErr.message);
+      return res.json({ connected: true });
+    } catch (error) {
+      console.error('Gateway 连接测试失败:', error.message);
+      return res.status(503).json({ connected: false });
+    }
+  }
+
+  // 保留旧路径作为兼容别名，但不再调用 Ombre MCP 或读取记忆。
+  app.get('/test-ombre', requireAdmin, testGatewayConnection);
+  app.get('/test-gateway', requireAdmin, testGatewayConnection);
+
+  // ---------- 获取 Gateway 模型列表（仅管理员，不接收客户端密钥） ----------
+  app.post('/models', requireAdmin, async (req, res) => {
+    if (req.body?.base_url !== undefined || req.body?.api_key !== undefined) {
+      return res.status(400).json({ error: '不再接受客户端 Gateway 地址或密钥' });
     }
 
-    // 3. 加载数据库历史消息
-    const { data: history, error } = await supabase
-      .from('messages')
-      .select('role, content')
-      .eq('session_id', finalSessionId)
-      .eq('visible', true)
-      .order('created_at', { ascending: true })
-      .limit(20);
+    try {
+      const response = await requestGateway('/models', { method: 'GET' });
+      if (!response.ok) {
+        console.error('获取 Gateway 模型列表失败:', { status: response.status });
+        return res.status(502).json({ success: false, error: '无法获取模型列表' });
+      }
+      const data = await response.json();
+      const models = Array.isArray(data?.data)
+        ? data.data.map(item => item?.id).filter(Boolean)
+        : [];
+      return res.json({ success: true, models });
+    } catch (error) {
+      console.error('获取 Gateway 模型列表失败:', error.message);
+      return res.status(error.code === 'GATEWAY_CONFIG_ERROR' ? 503 : 502).json({
+        success: false,
+        error: '无法获取模型列表'
+      });
+    }
+  });
 
-    if (error) console.error('加载历史消息失败:', error);
+  // ---------- AI 配置只允许通过部署环境管理 ----------
+  app.post('/admin/config', requireAdmin, (req, res) => {
+    return res.status(410).json({
+      success: false,
+      error: 'AI 配置已改为仅通过服务端环境变量管理'
+    });
+  });
 
-    // 4. 组装上下文（包含记忆）
-    const systemPrompt = `你是一个温柔、体贴的AI助手，说话简洁自然，像朋友一样陪伴。
+  // ---------- 对话接口：CC Home → Haven-Ombre Gateway ----------
+  app.post('/chat', chatRateLimit, requireChatAccess, async (req, res) => {
+    const { message, sessionId } = req.body || {};
+    if (typeof message !== 'string' || !message.trim()) {
+      return res.status(400).json({ error: '消息内容不能为空' });
+    }
+    if (message.length > chatMaxMessageLength) {
+      return res.status(413).json({
+        error: `消息内容不能超过 ${chatMaxMessageLength} 个字符`
+      });
+    }
 
-【关于我们的记忆】
-${memories || '（这是我们的第一次对话，还没有共同记忆。）'}
+    const finalSessionId = normalizeSessionId(
+      sessionId,
+      env.CC_HOME_DEFAULT_SESSION_ID || 'cc-home-main'
+    );
+    if (!finalSessionId) {
+      return res.status(400).json({ error: 'sessionId 格式无效' });
+    }
 
-请基于以上记忆和当前的对话，自然地回应。`;
+    try {
+      const config = gatewayChatConfig();
 
-    const messages = [
-      { role: 'system', content: systemPrompt },
-      ...(history || []).map(msg => ({ role: msg.role, content: msg.content })),
-      { role: 'user', content: message }
-    ];
+      // Supabase 仅保存 CC Home 界面历史；取最近 20 条后恢复时间正序。
+      const { data: history, error: historyError } = await supabase
+        .from('messages')
+        .select('role, content')
+        .eq('session_id', finalSessionId)
+        .eq('visible', true)
+        .order('created_at', { ascending: false })
+        .limit(20);
 
-    // 5. 调用 AI 模型（优先使用数据库配置）
-    let reply = '';
-    if (!base_url || !api_key || !model_name) {
-      const mockReplies = ['我听到了，你想说什么呢？', '嗯，我在听你说话。', '今天过得怎么样？'];
-      reply = mockReplies[Math.floor(Math.random() * mockReplies.length)];
-      console.warn('⚠️ 缺少 AI 配置，使用模拟回复');
-    } else {
-      const url = base_url.endsWith('/') ? `${base_url}chat/completions` : `${base_url}/chat/completions`;
-      const response = await fetch(url, {
+      if (historyError) {
+        console.error('加载历史消息失败:', historyError.message || historyError);
+      }
+
+      const messages = [
+        ...normalizeHistory(historyError ? [] : history),
+        { role: 'user', content: message }
+      ];
+
+      const response = await requestGateway('/chat/completions', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${api_key}`
+          'X-Ombre-Session-Id': finalSessionId
         },
         body: JSON.stringify({
-          model: model_name,
-          messages: messages,
+          model: config.model,
+          messages,
           temperature: 0.7,
-          max_tokens: 1000
+          max_tokens: 1000,
+          stream: false
         })
       });
 
       if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`AI API 错误: ${response.status} ${errText}`);
+        console.error('Gateway 对话请求失败:', { status: response.status });
+        return res.status(502).json({
+          error: '上游服务暂时不可用',
+          reply: '抱歉，我现在有点不在状态，请稍后再试试。'
+        });
       }
 
       const data = await response.json();
-      reply = data.choices?.[0]?.message?.content || '抱歉，我没有理解你的意思。';
+      const reply = data?.choices?.[0]?.message?.content;
+      if (typeof reply !== 'string' || !reply.trim()) {
+        console.error('Gateway 返回格式无效');
+        return res.status(502).json({
+          error: '上游服务返回无效',
+          reply: '抱歉，我现在有点不在状态，请稍后再试试。'
+        });
+      }
+
+      try {
+        const { error: saveError } = await supabase.from('messages').insert([
+          { session_id: finalSessionId, role: 'user', content: message },
+          { session_id: finalSessionId, role: 'ai', content: reply }
+        ]);
+        if (saveError) {
+          console.error('保存消息失败:', saveError.message || saveError);
+        }
+      } catch (saveError) {
+        console.error('保存消息失败:', saveError.message);
+      }
+
+      return res.json({ reply });
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        console.error('/chat Gateway 请求超时');
+        return res.status(504).json({
+          error: '上游服务响应超时',
+          reply: '抱歉，回复等得有点久，请稍后再试试。'
+        });
+      }
+
+      if (error.code === 'GATEWAY_CONFIG_ERROR') {
+        console.error('/chat Gateway 配置错误:', error.message);
+        return res.status(503).json({
+          error: '对话服务尚未配置',
+          reply: '抱歉，对话服务暂时不可用。'
+        });
+      }
+
+      console.error('/chat 接口错误:', error.message);
+      return res.status(502).json({
+        error: '上游服务暂时不可用',
+        reply: '抱歉，我现在有点不在状态，请稍后再试试。'
+      });
     }
+  });
 
-    // 6. 保存消息到数据库
-    try {
-      await supabase.from('messages').insert([
-        { session_id: finalSessionId, role: 'user', content: message },
-        { session_id: finalSessionId, role: 'ai', content: reply }
-      ]);
-    } catch (saveError) {
-      console.error('保存消息失败:', saveError);
+  // ---------- 统一错误响应 ----------
+  app.use((error, req, res, next) => {
+    if (error.code === 'CORS_NOT_ALLOWED') {
+      return res.status(403).json({ error: '不允许的跨域来源' });
     }
-
-    // 7. 存储对话到 Ombre Brain 记忆
-    try {
-      const memoryText = `用户说：${message}\nAI说：${reply}`;
-      await callOmbreTool('hold', { content: memoryText });
-      console.log('💾 对话已存入 Ombre Brain 记忆');
-    } catch (holdErr) {
-      console.warn('⚠️ 记忆存储失败（不影响回复）:', holdErr.message);
+    if (error.type === 'entity.too.large') {
+      return res.status(413).json({ error: '请求内容过大' });
     }
+    console.error('未处理的请求错误:', error.message);
+    return res.status(500).json({ error: '服务器内部错误' });
+  });
 
-    res.json({ reply });
+  return app;
+}
 
-  } catch (error) {
-    console.error('/chat 接口错误:', error);
-    res.status(500).json({
-      error: '服务器内部错误',
-      reply: '抱歉，我现在有点不在状态，请稍后再试试。'
-    });
-  }
-});
+function startServer() {
+  const app = createApp();
+  const port = process.env.PORT || 3000;
+  return app.listen(port, () => {
+    console.log(`✅ 后端服务已启动，端口: ${port}`);
+    console.log('   /health       - 健康检查');
+    console.log('   /test-db      - 数据库连接测试');
+    console.log('   /test-gateway - Gateway 连接测试');
+    console.log('   /models       - 获取 Gateway 模型列表 (POST)');
+    console.log('   /chat         - 对话接口（Gateway 模式）');
+  });
+}
 
-// ---------- 启动服务器 ----------
-app.listen(port, async () => {
-  console.log(`✅ 后端服务已启动，端口: ${port}`);
-  console.log(`   /health    - 健康检查`);
-  console.log(`   /test-db   - 数据库连接测试`);
-  console.log(`   /test-ombre - Ombre Brain 连接测试`);
-  console.log(`   /models    - 获取模型列表 (POST)`);
-  console.log(`   /admin/config - 更新 AI 配置 (POST)`);
-  console.log(`   /chat      - 对话接口（已接入记忆）`);
+if (require.main === module) {
+  startServer();
+}
 
-  // 启动时预连接 Ombre Brain
-  try {
-    await initOmbreSession();
-  } catch (e) {
-    console.warn('⚠️ 首次 Ombre Brain 连接失败，将在首次调用时重试');
-  }
-});
+module.exports = {
+  createApp,
+  normalizeHistory,
+  normalizeSessionId,
+  validateGatewayBaseUrl
+};
