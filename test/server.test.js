@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const { once } = require('node:events');
 
-const { createApp } = require('../server');
+const { createApp, toSupabaseSessionId } = require('../server');
 
 const baseEnv = {
   NODE_ENV: 'production',
@@ -118,6 +118,23 @@ async function closeServer(server) {
   await once(server, 'close');
 }
 
+test('字符串 session 确定性映射为 Supabase bigint 兼容 ID', () => {
+  const firstUuid = '550e8400-e29b-41d4-a716-446655440000';
+  const secondUuid = '550e8400-e29b-41d4-a716-446655440001';
+  const firstMapped = toSupabaseSessionId(firstUuid);
+  const repeatedMapped = toSupabaseSessionId(firstUuid);
+  const secondMapped = toSupabaseSessionId(secondUuid);
+
+  assert.equal(firstMapped, repeatedMapped);
+  assert.notEqual(firstMapped, secondMapped);
+  assert.match(firstMapped, /^\d+$/);
+  assert.equal(BigInt(firstMapped) > 0n, true);
+  assert.equal(BigInt(firstMapped) <= 9_223_372_036_854_775_807n, true);
+  assert.equal(toSupabaseSessionId('1723456789012'), '1723456789012');
+  assert.equal(toSupabaseSessionId(1723456789012), '1723456789012');
+  assert.equal(toSupabaseSessionId('000123'), '123');
+});
+
 test('生产环境 /chat 使用独立 CHAT_ACCESS_TOKEN', async t => {
   async function runChat(headers, chatAccess, env = baseEnv) {
     const supabase = createFakeSupabase();
@@ -189,6 +206,8 @@ test('生产环境 /chat 使用独立 CHAT_ACCESS_TOKEN', async t => {
 });
 
 test('稳定传递 session，读取最近历史并把 ai 转为 assistant', async () => {
+  const sessionId = '550e8400-e29b-41d4-a716-446655440000';
+  const supabaseSessionId = toSupabaseSessionId(sessionId);
   const supabase = createFakeSupabase({
     // 模拟数据库按 created_at DESC 返回。
     history: [
@@ -209,11 +228,11 @@ test('稳定传递 session，读取最近历史并把 ai 转为 assistant', asyn
   try {
     const first = await request(server, '/chat', {
       method: 'POST',
-      body: { message: '第一轮', sessionId: 'session-123' }
+      body: { message: '第一轮', sessionId }
     });
     const second = await request(server, '/chat', {
       method: 'POST',
-      body: { message: '第二轮', sessionId: 'session-123' }
+      body: { message: '第二轮', sessionId }
     });
 
     assert.equal(first.status, 200);
@@ -222,8 +241,8 @@ test('稳定传递 session，读取最近历史并把 ai 转为 assistant', asyn
     assert.equal(gatewayCalls.length, 2);
     assert.equal(gatewayCalls[0].url, 'https://gateway.invalid/v1/chat/completions');
     assert.equal(gatewayCalls[0].options.headers.Authorization, 'Bearer gateway-test-token');
-    assert.equal(gatewayCalls[0].options.headers['X-Ombre-Session-Id'], 'session-123');
-    assert.equal(gatewayCalls[1].options.headers['X-Ombre-Session-Id'], 'session-123');
+    assert.equal(gatewayCalls[0].options.headers['X-Ombre-Session-Id'], sessionId);
+    assert.equal(gatewayCalls[1].options.headers['X-Ombre-Session-Id'], sessionId);
     assert.equal(gatewayCalls[0].payload.stream, false);
     assert.equal(gatewayCalls[0].payload.model, 'test-model');
     assert.deepEqual(gatewayCalls[0].payload.messages, [
@@ -234,10 +253,17 @@ test('稳定传递 session，读取最近历史并把 ai 转为 assistant', asyn
 
     const orderCall = supabase.calls.find(call => call.method === 'order');
     assert.deepEqual(orderCall.options, { ascending: false });
+    const sessionQueries = supabase.calls.filter(
+      call => call.method === 'eq' && call.column === 'session_id'
+    );
+    assert.deepEqual(sessionQueries.map(call => call.value), [
+      supabaseSessionId,
+      supabaseSessionId
+    ]);
     assert.equal(supabase.inserts.length, 2);
     assert.deepEqual(supabase.inserts[0], [
-      { session_id: 'session-123', role: 'user', content: '第一轮' },
-      { session_id: 'session-123', role: 'ai', content: '模拟回复' }
+      { session_id: supabaseSessionId, role: 'user', content: '第一轮' },
+      { session_id: supabaseSessionId, role: 'ai', content: '模拟回复' }
     ]);
     assert.equal(supabase.calls.some(call => call.table === 'settings'), false);
     assert.equal(gatewayCalls.some(call => call.url.includes('/mcp')), false);
@@ -246,9 +272,39 @@ test('稳定传递 session，读取最近历史并把 ai 转为 assistant', asyn
   }
 });
 
+test('纯数字旧 session ID 对 Gateway 和 Supabase 保持兼容', async () => {
+  const sessionId = '1723456789012';
+  const supabase = createFakeSupabase();
+  let gatewaySessionId;
+  const gatewayFetch = async (url, options) => {
+    gatewaySessionId = options.headers['X-Ombre-Session-Id'];
+    return response(200, { choices: [{ message: { content: '数字会话回复' } }] });
+  };
+  const server = await startTestServer({ env: baseEnv, supabaseClient: supabase, gatewayFetch });
+
+  try {
+    const result = await request(server, '/chat', {
+      method: 'POST',
+      body: { message: '数字旧会话', sessionId }
+    });
+
+    assert.equal(result.status, 200);
+    assert.equal(gatewaySessionId, sessionId);
+    const sessionQuery = supabase.calls.find(
+      call => call.method === 'eq' && call.column === 'session_id'
+    );
+    assert.equal(sessionQuery.value, sessionId);
+    assert.equal(supabase.inserts[0][0].session_id, sessionId);
+    assert.equal(supabase.inserts[0][1].session_id, sessionId);
+  } finally {
+    await closeServer(server);
+  }
+});
+
 test('缺少 sessionId 时始终使用稳定后备值', async () => {
   const supabase = createFakeSupabase();
   const sessions = [];
+  const defaultSupabaseSessionId = toSupabaseSessionId('cc-home-main');
   const gatewayFetch = async (url, options) => {
     sessions.push(options.headers['X-Ombre-Session-Id']);
     return response(200, { choices: [{ message: { content: 'ok' } }] });
@@ -259,8 +315,15 @@ test('缺少 sessionId 时始终使用稳定后备值', async () => {
     await request(server, '/chat', { method: 'POST', body: { message: '一' } });
     await request(server, '/chat', { method: 'POST', body: { message: '二' } });
     assert.deepEqual(sessions, ['cc-home-main', 'cc-home-main']);
-    assert.equal(supabase.inserts[0][0].session_id, 'cc-home-main');
-    assert.equal(supabase.inserts[1][0].session_id, 'cc-home-main');
+    const sessionQueries = supabase.calls.filter(
+      call => call.method === 'eq' && call.column === 'session_id'
+    );
+    assert.deepEqual(sessionQueries.map(call => call.value), [
+      defaultSupabaseSessionId,
+      defaultSupabaseSessionId
+    ]);
+    assert.equal(supabase.inserts[0][0].session_id, defaultSupabaseSessionId);
+    assert.equal(supabase.inserts[1][0].session_id, defaultSupabaseSessionId);
   } finally {
     await closeServer(server);
   }
