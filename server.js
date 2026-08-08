@@ -86,6 +86,33 @@ function normalizeSessionId(value, fallback) {
   return normalized;
 }
 
+// PostgreSQL bigint 的正数高位区间用于字符串 session 的确定性映射。
+// 以十进制字符串交给 PostgREST，避免 JavaScript Number 丢失 64 位整数精度。
+const POSTGRES_BIGINT_MAX = 9_223_372_036_854_775_807n;
+const HASHED_SESSION_ID_BASE = 1n << 62n;
+const HASHED_SESSION_ID_MASK = HASHED_SESSION_ID_BASE - 1n;
+
+function toSupabaseSessionId(sessionId) {
+  const normalized = String(sessionId);
+
+  // 兼容数据库中已经存在的纯数字 bigint session ID，并去掉无意义的前导零。
+  if (/^\d+$/.test(normalized)) {
+    const numericId = BigInt(normalized);
+    if (numericId <= POSTGRES_BIGINT_MAX) {
+      return numericId.toString();
+    }
+  }
+
+  // 域分隔字符串固定为 v1；修改它会破坏已有字符串 session 的映射连续性。
+  const digest = crypto
+    .createHash('sha256')
+    .update('cc-home:supabase-session:v1\0', 'utf8')
+    .update(normalized, 'utf8')
+    .digest();
+  const hashPrefix = digest.readBigUInt64BE(0);
+  return (HASHED_SESSION_ID_BASE + (hashPrefix & HASHED_SESSION_ID_MASK)).toString();
+}
+
 function normalizeHistory(history) {
   const roleMap = {
     user: 'user',
@@ -355,13 +382,14 @@ function createApp(options = {}) {
       });
     }
 
-    const finalSessionId = normalizeSessionId(
+    const gatewaySessionId = normalizeSessionId(
       sessionId,
       env.CC_HOME_DEFAULT_SESSION_ID || 'cc-home-main'
     );
-    if (!finalSessionId) {
+    if (!gatewaySessionId) {
       return res.status(400).json({ error: 'sessionId 格式无效' });
     }
+    const supabaseSessionId = toSupabaseSessionId(gatewaySessionId);
 
     try {
       const config = gatewayChatConfig();
@@ -370,7 +398,7 @@ function createApp(options = {}) {
       const { data: history, error: historyError } = await supabase
         .from('messages')
         .select('role, content')
-        .eq('session_id', finalSessionId)
+        .eq('session_id', supabaseSessionId)
         .eq('visible', true)
         .order('created_at', { ascending: false })
         .limit(20);
@@ -388,7 +416,7 @@ function createApp(options = {}) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Ombre-Session-Id': finalSessionId
+          'X-Ombre-Session-Id': gatewaySessionId
         },
         body: JSON.stringify({
           model: config.model,
@@ -419,8 +447,8 @@ function createApp(options = {}) {
 
       try {
         const { error: saveError } = await supabase.from('messages').insert([
-          { session_id: finalSessionId, role: 'user', content: message },
-          { session_id: finalSessionId, role: 'ai', content: reply }
+          { session_id: supabaseSessionId, role: 'user', content: message },
+          { session_id: supabaseSessionId, role: 'ai', content: reply }
         ]);
         if (saveError) {
           console.error('保存消息失败:', saveError.message || saveError);
@@ -491,5 +519,6 @@ module.exports = {
   createApp,
   normalizeHistory,
   normalizeSessionId,
+  toSupabaseSessionId,
   validateGatewayBaseUrl
 };
