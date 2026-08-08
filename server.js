@@ -86,6 +86,11 @@ function normalizeSessionId(value, fallback) {
   return normalized;
 }
 
+function isUuid(value) {
+  return typeof value === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
 // PostgreSQL bigint 的正数高位区间用于字符串 session 的确定性映射。
 // 以十进制字符串交给 PostgREST，避免 JavaScript Number 丢失 64 位整数精度。
 const POSTGRES_BIGINT_MAX = 9_223_372_036_854_775_807n;
@@ -127,6 +132,24 @@ function normalizeHistory(history) {
     .map(item => ({ role: roleMap[item.role], content: item.content }));
 }
 
+function normalizeClientHistory(history) {
+  const roleMap = {
+    user: 'user',
+    ai: 'assistant',
+    assistant: 'assistant'
+  };
+
+  return (Array.isArray(history) ? history : [])
+    .slice()
+    .reverse()
+    .filter(item => item && roleMap[item.role] && typeof item.content === 'string')
+    .map(item => ({
+      role: roleMap[item.role],
+      content: item.content,
+      createdAt: typeof item.created_at === 'string' ? item.created_at : null
+    }));
+}
+
 function createApp(options = {}) {
   const env = options.env || process.env;
   const isProduction = env.NODE_ENV === 'production';
@@ -135,6 +158,8 @@ function createApp(options = {}) {
     env.SUPABASE_URL,
     env.SUPABASE_KEY
   );
+  const supabaseAuth = options.supabaseAuth || supabase.auth;
+  const randomUUID = options.randomUUID || crypto.randomUUID;
 
   if (typeof gatewayFetch !== 'function') {
     throw new Error('当前 Node.js 环境不支持 fetch');
@@ -194,31 +219,70 @@ function createApp(options = {}) {
     return next();
   }
 
-  // ---------- 生产环境聊天访问验证 ----------
-  function requireChatAccess(req, res, next) {
-    if (!isProduction) return next();
-
-    const chatAccessToken = env.CHAT_ACCESS_TOKEN;
-    if (!chatAccessToken) {
-      console.error('聊天接口不可用：未配置 CHAT_ACCESS_TOKEN');
-      return res.status(503).json({ error: '聊天访问功能未配置' });
+  // ---------- 聊天访问验证 ----------
+  async function requireChatAccess(req, res, next) {
+    // 长期内部烟测凭证使用独立 header，绝不与浏览器 Supabase JWT 混用。
+    const internalCandidate = req.get('x-cc-home-internal-token') || '';
+    if (internalCandidate) {
+      const chatAccessToken = env.CHAT_ACCESS_TOKEN;
+      if (!chatAccessToken) {
+        console.error('内部聊天烟测不可用：未配置 CHAT_ACCESS_TOKEN');
+        return res.status(503).json({ error: '内部聊天烟测未配置' });
+      }
+      if (!secureTokenEquals(internalCandidate, chatAccessToken)) {
+        return res.status(401).json({ error: '聊天访问验证失败' });
+      }
+      req.chatPrincipal = { type: 'internal' };
+      return next();
     }
 
+    // Authorization 仅接受 Supabase Auth 签发的用户 access token。
     const authorization = req.get('authorization') || '';
     const bearerToken = authorization.startsWith('Bearer ')
       ? authorization.slice(7).trim()
       : '';
-
-    if (!secureTokenEquals(bearerToken, chatAccessToken)) {
+    if (!bearerToken) {
       return res.status(401).json({ error: '聊天访问验证失败' });
     }
-    return next();
+
+    const allowedUserId = typeof env.CHAT_ALLOWED_USER_ID === 'string'
+      ? env.CHAT_ALLOWED_USER_ID.trim()
+      : '';
+    if (!allowedUserId) {
+      console.error('聊天接口不可用：未配置 CHAT_ALLOWED_USER_ID');
+      return res.status(503).json({ error: '聊天访问功能未配置' });
+    }
+    if (!supabaseAuth || typeof supabaseAuth.getUser !== 'function') {
+      console.error('聊天接口不可用：Supabase Auth 客户端未配置');
+      return res.status(503).json({ error: '聊天访问功能未配置' });
+    }
+
+    try {
+      // getUser 会向 Supabase Auth 验证 token；不能用仅解码 JWT 的结果授权。
+      const { data, error } = await supabaseAuth.getUser(bearerToken);
+      const userId = data?.user?.id;
+      if (error || typeof userId !== 'string' || !userId) {
+        return res.status(401).json({ error: '聊天访问验证失败' });
+      }
+      if (userId !== allowedUserId) {
+        return res.status(403).json({ error: '无权访问聊天功能' });
+      }
+
+      req.chatPrincipal = { type: 'user', userId };
+      return next();
+    } catch {
+      return res.status(401).json({ error: '聊天访问验证失败' });
+    }
   }
 
   // ---------- /chat 基础频率限制 ----------
   const chatRateLimitWindowMs = positiveInteger(env.CHAT_RATE_LIMIT_WINDOW_MS, 60_000);
   const chatRateLimitMax = positiveInteger(env.CHAT_RATE_LIMIT_MAX, 20);
   const chatMaxMessageLength = positiveInteger(env.CHAT_MAX_MESSAGE_LENGTH, 4_000);
+  const chatHistoryMaxMessages = Math.min(
+    positiveInteger(env.CHAT_HISTORY_MAX_MESSAGES, 100),
+    200
+  );
   const chatRateLimits = new Map();
 
   function chatRateLimit(req, res, next) {
@@ -276,6 +340,104 @@ function createApp(options = {}) {
       throw error;
     }
     return { ...config, model: env.OMBRE_GATEWAY_MODEL.trim() };
+  }
+
+  function normalizeMainSessionRow(row, expectedUserId) {
+    if (
+      !row
+      || String(row.user_id) !== expectedUserId
+      || row.session_kind !== 'main'
+      || !isUuid(row.conversation_id)
+    ) {
+      return null;
+    }
+    return {
+      // 不读取 PostgREST 返回的 bigint，避免 JSON Number 导致 64 位精度丢失。
+      databaseId: toSupabaseSessionId(row.conversation_id),
+      gatewaySessionId: row.conversation_id,
+      persist: true
+    };
+  }
+
+  async function findMainSession(userId) {
+    const { data, error } = await supabase
+      .from('sessions')
+      .select('user_id, session_kind, conversation_id')
+      .eq('user_id', userId)
+      .eq('session_kind', 'main')
+      .maybeSingle();
+
+    if (error) {
+      const queryError = new Error('主聊天查询失败');
+      queryError.code = 'MAIN_SESSION_ERROR';
+      throw queryError;
+    }
+    if (!data) return null;
+
+    const session = normalizeMainSessionRow(data, userId);
+    if (!session) {
+      const shapeError = new Error('主聊天记录格式无效');
+      shapeError.code = 'MAIN_SESSION_ERROR';
+      throw shapeError;
+    }
+    return session;
+  }
+
+  async function resolveMainSession(userId) {
+    const existing = await findMainSession(userId);
+    if (existing) return existing;
+
+    // 唯一索引负责并发收敛；冲突后重新读取胜出的同一 main session。
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const conversationId = randomUUID();
+      if (!isUuid(conversationId)) {
+        const randomError = new Error('主聊天 UUID 生成失败');
+        randomError.code = 'MAIN_SESSION_ERROR';
+        throw randomError;
+      }
+      const databaseId = toSupabaseSessionId(conversationId);
+      const { error } = await supabase.from('sessions').insert({
+        id: databaseId,
+        name: '主聊天',
+        user_id: userId,
+        session_kind: 'main',
+        conversation_id: conversationId
+      });
+
+      const resolved = await findMainSession(userId);
+      if (resolved) return resolved;
+      if (!error || error.code !== '23505') break;
+    }
+
+    const createError = new Error('主聊天创建失败');
+    createError.code = 'MAIN_SESSION_ERROR';
+    throw createError;
+  }
+
+  async function resolveRequestSession(req) {
+    if (req.chatPrincipal?.type === 'internal') {
+      const gatewaySessionId = normalizeSessionId(
+        env.CC_HOME_SMOKE_SESSION_ID || 'cc-home-smoke',
+        null
+      );
+      if (
+        !gatewaySessionId
+        || !/^cc-home-smoke(?:[:._-][A-Za-z0-9._:-]+)?$/.test(gatewaySessionId)
+      ) {
+        const smokeError = new Error('内部烟测 session 配置无效');
+        smokeError.code = 'MAIN_SESSION_ERROR';
+        throw smokeError;
+      }
+      return { databaseId: null, gatewaySessionId, persist: false };
+    }
+
+    const userId = req.chatPrincipal?.userId;
+    if (!isUuid(userId)) {
+      const principalError = new Error('用户身份格式无效');
+      principalError.code = 'MAIN_SESSION_ERROR';
+      throw principalError;
+    }
+    return resolveMainSession(userId);
   }
 
   async function requestGateway(path, requestOptions = {}) {
@@ -370,9 +532,48 @@ function createApp(options = {}) {
     });
   });
 
+  // ---------- 聊天历史：只按已验证用户解析 owned main session ----------
+  // 客户端不能选择 session；三列所有权元数据均为 NULL 的 legacy 行永不参与查询。
+  app.get('/chat/history', chatRateLimit, requireChatAccess, async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    if (req.chatPrincipal?.type !== 'user') {
+      return res.status(403).json({ error: '内部烟测不能读取用户聊天历史' });
+    }
+    if (req.query.sessionId !== undefined) {
+      return res.status(400).json({ error: '客户端不能指定主聊天 sessionId' });
+    }
+
+    try {
+      const session = await resolveRequestSession(req);
+      const { data, error } = await supabase
+        .from('messages')
+        .select('role, content, created_at')
+        .eq('session_id', session.databaseId)
+        .eq('visible', true)
+        .order('created_at', { ascending: false })
+        .limit(chatHistoryMaxMessages);
+
+      if (error) {
+        console.error('加载聊天历史失败');
+        return res.status(503).json({ error: '聊天记录暂时不可用' });
+      }
+      return res.json({ messages: normalizeClientHistory(data) });
+    } catch (error) {
+      if (error.code === 'MAIN_SESSION_ERROR') {
+        console.error('解析主聊天失败');
+      } else {
+        console.error('加载聊天历史失败');
+      }
+      return res.status(503).json({ error: '聊天记录暂时不可用' });
+    }
+  });
+
   // ---------- 对话接口：CC Home → Haven-Ombre Gateway ----------
   app.post('/chat', chatRateLimit, requireChatAccess, async (req, res) => {
     const { message, sessionId } = req.body || {};
+    if (sessionId !== undefined) {
+      return res.status(400).json({ error: '客户端不能指定主聊天 sessionId' });
+    }
     if (typeof message !== 'string' || !message.trim()) {
       return res.status(400).json({ error: '消息内容不能为空' });
     }
@@ -382,29 +583,23 @@ function createApp(options = {}) {
       });
     }
 
-    const gatewaySessionId = normalizeSessionId(
-      sessionId,
-      env.CC_HOME_DEFAULT_SESSION_ID || 'cc-home-main'
-    );
-    if (!gatewaySessionId) {
-      return res.status(400).json({ error: 'sessionId 格式无效' });
-    }
-    const supabaseSessionId = toSupabaseSessionId(gatewaySessionId);
-
     try {
       const config = gatewayChatConfig();
+      const session = await resolveRequestSession(req);
 
       // Supabase 仅保存 CC Home 界面历史；取最近 20 条后恢复时间正序。
-      const { data: history, error: historyError } = await supabase
-        .from('messages')
-        .select('role, content')
-        .eq('session_id', supabaseSessionId)
-        .eq('visible', true)
-        .order('created_at', { ascending: false })
-        .limit(20);
+      const { data: history, error: historyError } = session.persist
+        ? await supabase
+          .from('messages')
+          .select('role, content')
+          .eq('session_id', session.databaseId)
+          .eq('visible', true)
+          .order('created_at', { ascending: false })
+          .limit(20)
+        : { data: [], error: null };
 
       if (historyError) {
-        console.error('加载历史消息失败:', historyError.message || historyError);
+        console.error('加载历史消息失败');
       }
 
       const messages = [
@@ -416,7 +611,7 @@ function createApp(options = {}) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Ombre-Session-Id': gatewaySessionId
+          'X-Ombre-Session-Id': session.gatewaySessionId
         },
         body: JSON.stringify({
           model: config.model,
@@ -445,33 +640,17 @@ function createApp(options = {}) {
         });
       }
 
-      let sessionReady = false;
-      try {
-        // messages.session_id 有外键；只提供 id，冲突时不覆盖已有名称和时间字段。
-        const { error: sessionError } = await supabase.from('sessions').upsert(
-          { id: supabaseSessionId },
-          { onConflict: 'id', ignoreDuplicates: true }
-        );
-        if (sessionError) {
-          console.error('确保会话记录失败');
-        } else {
-          sessionReady = true;
-        }
-      } catch {
-        console.error('确保会话记录失败');
-      }
-
-      if (sessionReady) {
+      if (session.persist) {
         try {
           const { error: saveError } = await supabase.from('messages').insert([
-            { session_id: supabaseSessionId, role: 'user', content: message },
-            { session_id: supabaseSessionId, role: 'ai', content: reply }
+            { session_id: session.databaseId, role: 'user', content: message },
+            { session_id: session.databaseId, role: 'ai', content: reply }
           ]);
           if (saveError) {
-            console.error('保存消息失败:', saveError.message || saveError);
+            console.error('保存消息失败');
           }
-        } catch (saveError) {
-          console.error('保存消息失败:', saveError.message);
+        } catch {
+          console.error('保存消息失败');
         }
       }
 
@@ -493,7 +672,15 @@ function createApp(options = {}) {
         });
       }
 
-      console.error('/chat 接口错误:', error.message);
+      if (error.code === 'MAIN_SESSION_ERROR') {
+        console.error('解析主聊天失败');
+        return res.status(503).json({
+          error: '聊天记录暂时不可用',
+          reply: '抱歉，聊天记录暂时不可用。'
+        });
+      }
+
+      console.error('/chat 接口错误');
       return res.status(502).json({
         error: '上游服务暂时不可用',
         reply: '抱歉，我现在有点不在状态，请稍后再试试。'
@@ -509,7 +696,7 @@ function createApp(options = {}) {
     if (error.type === 'entity.too.large') {
       return res.status(413).json({ error: '请求内容过大' });
     }
-    console.error('未处理的请求错误:', error.message);
+    console.error('未处理的请求错误');
     return res.status(500).json({ error: '服务器内部错误' });
   });
 
@@ -526,6 +713,7 @@ function startServer() {
     console.log('   /test-gateway - Gateway 连接测试');
     console.log('   /models       - 获取 Gateway 模型列表 (POST)');
     console.log('   /chat         - 对话接口（Gateway 模式）');
+    console.log('   /chat/history - 获取聊天历史');
   });
 }
 
@@ -535,6 +723,7 @@ if (require.main === module) {
 
 module.exports = {
   createApp,
+  normalizeClientHistory,
   normalizeHistory,
   normalizeSessionId,
   toSupabaseSessionId,
