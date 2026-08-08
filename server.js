@@ -445,16 +445,34 @@ function createApp(options = {}) {
         });
       }
 
+      let sessionReady = false;
       try {
-        const { error: saveError } = await supabase.from('messages').insert([
-          { session_id: supabaseSessionId, role: 'user', content: message },
-          { session_id: supabaseSessionId, role: 'ai', content: reply }
-        ]);
-        if (saveError) {
-          console.error('保存消息失败:', saveError.message || saveError);
+        // messages.session_id 有外键；只提供 id，冲突时不覆盖已有名称和时间字段。
+        const { error: sessionError } = await supabase.from('sessions').upsert(
+          { id: supabaseSessionId },
+          { onConflict: 'id', ignoreDuplicates: true }
+        );
+        if (sessionError) {
+          console.error('确保会话记录失败');
+        } else {
+          sessionReady = true;
         }
-      } catch (saveError) {
-        console.error('保存消息失败:', saveError.message);
+      } catch {
+        console.error('确保会话记录失败');
+      }
+
+      if (sessionReady) {
+        try {
+          const { error: saveError } = await supabase.from('messages').insert([
+            { session_id: supabaseSessionId, role: 'user', content: message },
+            { session_id: supabaseSessionId, role: 'ai', content: reply }
+          ]);
+          if (saveError) {
+            console.error('保存消息失败:', saveError.message || saveError);
+          }
+        } catch (saveError) {
+          console.error('保存消息失败:', saveError.message);
+        }
       }
 
       return res.json({ reply });

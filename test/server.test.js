@@ -32,10 +32,16 @@ function response(status, body) {
 function createFakeSupabase(options = {}) {
   const calls = [];
   const inserts = [];
+  const upserts = [];
+  const sessions = new Map(
+    (options.existingSessions || []).map(session => [String(session.id), { ...session }])
+  );
 
   return {
     calls,
     inserts,
+    upserts,
+    sessions,
     from(table) {
       calls.push({ method: 'from', table });
       const query = {
@@ -59,9 +65,25 @@ function createFakeSupabase(options = {}) {
           });
         },
         insert(rows) {
-          calls.push({ method: 'insert', table });
+          calls.push({ method: 'insert', table, rows });
           inserts.push(rows);
           return Promise.resolve({ error: options.insertError || null });
+        },
+        upsert(rows, upsertOptions) {
+          calls.push({ method: 'upsert', table, rows, options: upsertOptions });
+          upserts.push(rows);
+
+          if (options.sessionUpsertError) {
+            return Promise.resolve({ error: options.sessionUpsertError });
+          }
+
+          const records = Array.isArray(rows) ? rows : [rows];
+          for (const record of records) {
+            const key = String(record.id);
+            if (sessions.has(key) && upsertOptions?.ignoreDuplicates) continue;
+            sessions.set(key, { ...sessions.get(key), ...record });
+          }
+          return Promise.resolve({ error: null });
         }
       };
       return query;
@@ -272,6 +294,148 @@ test('稳定传递 session，读取最近历史并把 ai 转为 assistant', asyn
   }
 });
 
+test('保存消息前幂等确保 sessions 外键父记录', async t => {
+  const sessionId = '550e8400-e29b-41d4-a716-446655440099';
+  const supabaseSessionId = toSupabaseSessionId(sessionId);
+  const gatewayFetch = async () => response(200, {
+    choices: [{ message: { content: '已回复' } }]
+  });
+
+  await t.test('新 session 先创建父记录再保存 messages', async () => {
+    const supabase = createFakeSupabase();
+    const server = await startTestServer({ env: baseEnv, supabaseClient: supabase, gatewayFetch });
+
+    try {
+      const result = await request(server, '/chat', {
+        method: 'POST',
+        body: { message: '新会话', sessionId }
+      });
+
+      assert.equal(result.status, 200);
+      assert.deepEqual(supabase.upserts, [{ id: supabaseSessionId }]);
+      const sessionUpsert = supabase.calls.find(call => call.method === 'upsert');
+      assert.equal(sessionUpsert.table, 'sessions');
+      assert.deepEqual(sessionUpsert.options, {
+        onConflict: 'id',
+        ignoreDuplicates: true
+      });
+      assert.deepEqual(sessionUpsert.rows, { id: supabaseSessionId });
+
+      const upsertIndex = supabase.calls.findIndex(call => call.method === 'upsert');
+      const messageInsertIndex = supabase.calls.findIndex(
+        call => call.method === 'insert' && call.table === 'messages'
+      );
+      assert.equal(upsertIndex < messageInsertIndex, true);
+      assert.deepEqual(supabase.sessions.get(supabaseSessionId), { id: supabaseSessionId });
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  await t.test('同一 session 多轮调用保持幂等', async () => {
+    const supabase = createFakeSupabase();
+    const server = await startTestServer({ env: baseEnv, supabaseClient: supabase, gatewayFetch });
+
+    try {
+      await request(server, '/chat', {
+        method: 'POST',
+        body: { message: '第一轮', sessionId }
+      });
+      await request(server, '/chat', {
+        method: 'POST',
+        body: { message: '第二轮', sessionId }
+      });
+
+      assert.equal(supabase.upserts.length, 2);
+      assert.deepEqual(supabase.upserts, [
+        { id: supabaseSessionId },
+        { id: supabaseSessionId }
+      ]);
+      assert.equal(supabase.sessions.size, 1);
+      assert.equal(supabase.inserts.length, 2);
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  await t.test('已有 session 不覆盖名称和时间字段', async () => {
+    const existingSession = {
+      id: supabaseSessionId,
+      name: '已有会话名称',
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-02-01T00:00:00Z'
+    };
+    const supabase = createFakeSupabase({ existingSessions: [existingSession] });
+    const server = await startTestServer({ env: baseEnv, supabaseClient: supabase, gatewayFetch });
+
+    try {
+      await request(server, '/chat', {
+        method: 'POST',
+        body: { message: '继续会话', sessionId }
+      });
+
+      assert.deepEqual(supabase.sessions.get(supabaseSessionId), existingSession);
+      assert.deepEqual(supabase.upserts, [{ id: supabaseSessionId }]);
+      assert.equal(supabase.inserts.length, 1);
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  await t.test('Gateway 失败时不创建空 session', async () => {
+    const supabase = createFakeSupabase();
+    const originalError = console.error;
+    console.error = () => {};
+    const server = await startTestServer({
+      env: baseEnv,
+      supabaseClient: supabase,
+      gatewayFetch: async () => response(502, { error: 'fake upstream error' })
+    });
+
+    try {
+      const result = await request(server, '/chat', {
+        method: 'POST',
+        body: { message: '不会保存', sessionId }
+      });
+
+      assert.equal(result.status, 502);
+      assert.equal(supabase.upserts.length, 0);
+      assert.equal(supabase.inserts.length, 0);
+      assert.equal(supabase.calls.some(call => call.table === 'sessions'), false);
+    } finally {
+      console.error = originalError;
+      await closeServer(server);
+    }
+  });
+
+  await t.test('session 创建失败时不保存 messages 但仍返回模型回复', async () => {
+    const supabase = createFakeSupabase({
+      sessionUpsertError: new Error('不应写入日志的模拟敏感内容 gateway-test-token')
+    });
+    const originalError = console.error;
+    const errors = [];
+    console.error = (...args) => errors.push(args);
+    const server = await startTestServer({ env: baseEnv, supabaseClient: supabase, gatewayFetch });
+
+    try {
+      const result = await request(server, '/chat', {
+        method: 'POST',
+        body: { message: '保存会失败', sessionId }
+      });
+
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.body, { reply: '已回复' });
+      assert.equal(supabase.upserts.length, 1);
+      assert.equal(supabase.inserts.length, 0);
+      assert.deepEqual(errors, [['确保会话记录失败']]);
+      assert.equal(JSON.stringify(errors).includes('gateway-test-token'), false);
+    } finally {
+      console.error = originalError;
+      await closeServer(server);
+    }
+  });
+});
+
 test('纯数字旧 session ID 对 Gateway 和 Supabase 保持兼容', async () => {
   const sessionId = '1723456789012';
   const supabase = createFakeSupabase();
@@ -294,6 +458,7 @@ test('纯数字旧 session ID 对 Gateway 和 Supabase 保持兼容', async () =
       call => call.method === 'eq' && call.column === 'session_id'
     );
     assert.equal(sessionQuery.value, sessionId);
+    assert.deepEqual(supabase.upserts, [{ id: sessionId }]);
     assert.equal(supabase.inserts[0][0].session_id, sessionId);
     assert.equal(supabase.inserts[0][1].session_id, sessionId);
   } finally {
