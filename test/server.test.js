@@ -39,6 +39,17 @@ function response(status, body) {
   };
 }
 
+function compareQueryValues(left, right) {
+  const leftValue = String(left);
+  const rightValue = String(right);
+  if (/^-?\d+$/.test(leftValue) && /^-?\d+$/.test(rightValue)) {
+    const leftBigInt = BigInt(leftValue);
+    const rightBigInt = BigInt(rightValue);
+    return leftBigInt < rightBigInt ? -1 : leftBigInt > rightBigInt ? 1 : 0;
+  }
+  return leftValue.localeCompare(rightValue);
+}
+
 function createFakeSupabase(options = {}) {
   const calls = [];
   const inserts = [];
@@ -85,11 +96,10 @@ function createFakeSupabase(options = {}) {
         }
         if (queryState.order && rows.every(row => row[queryState.order.column])) {
           const direction = queryState.order.options?.ascending ? 1 : -1;
-          rows.sort((left, right) =>
-            direction * String(left[queryState.order.column]).localeCompare(
-              String(right[queryState.order.column])
-            )
-          );
+          rows.sort((left, right) => direction * compareQueryValues(
+            left[queryState.order.column],
+            right[queryState.order.column]
+          ));
         }
         if (queryState.limit !== null) rows = rows.slice(0, queryState.limit);
         return Promise.resolve({
@@ -535,28 +545,51 @@ test('GET /chat/history 复用鉴权、session 映射并安全返回正序历史
     }
   });
 
-  await t.test('使用确定性 bigint 映射、过滤角色并按时间正序返回', async () => {
+  await t.test('同时间消息按 id 正序返回并过滤非法角色', async () => {
     const supabase = createFakeSupabase({
       existingSessions: [mainSession],
-      // 模拟数据库按 created_at DESC 返回。
+      // 故意打乱输入；mock 必须按查询指定的 id DESC 排序，再由接口恢复正序。
       history: [
         {
+          id: '102',
+          role: 'ai',
+          content: '第一轮回答',
+          created_at: '2026-08-09T01:00:00.000Z',
+          session_id: supabaseSessionId,
+          visible: true
+        },
+        {
+          id: '105',
           role: 'system',
           content: '不应返回',
           created_at: '2026-08-09T03:00:00.000Z',
-          internal_secret: '不应泄露'
+          internal_secret: '不应泄露',
+          session_id: supabaseSessionId,
+          visible: true
         },
         {
+          id: '104',
           role: 'ai',
-          content: '较新的回复',
+          content: '第二轮回答',
           created_at: '2026-08-09T02:00:00.000Z',
-          session_id: supabaseSessionId
+          session_id: supabaseSessionId,
+          visible: true
         },
         {
+          id: '101',
           role: 'user',
-          content: '较早的消息',
+          content: '第一轮问题',
           created_at: '2026-08-09T01:00:00.000Z',
-          session_id: supabaseSessionId
+          session_id: supabaseSessionId,
+          visible: true
+        },
+        {
+          id: '103',
+          role: 'user',
+          content: '第二轮问题',
+          created_at: '2026-08-09T02:00:00.000Z',
+          session_id: supabaseSessionId,
+          visible: true
         }
       ]
     });
@@ -589,12 +622,22 @@ test('GET /chat/history 复用鉴权、session 映射并安全返回正序历史
         messages: [
           {
             role: 'user',
-            content: '较早的消息',
+            content: '第一轮问题',
             createdAt: '2026-08-09T01:00:00.000Z'
           },
           {
             role: 'assistant',
-            content: '较新的回复',
+            content: '第一轮回答',
+            createdAt: '2026-08-09T01:00:00.000Z'
+          },
+          {
+            role: 'user',
+            content: '第二轮问题',
+            createdAt: '2026-08-09T02:00:00.000Z'
+          },
+          {
+            role: 'assistant',
+            content: '第二轮回答',
             createdAt: '2026-08-09T02:00:00.000Z'
           }
         ]
@@ -615,6 +658,7 @@ test('GET /chat/history 复用鉴权、session 映射并安全返回正序历史
       );
       assert.equal(visibleQuery.value, true);
       const orderCall = supabase.calls.find(call => call.method === 'order');
+      assert.equal(orderCall.column, 'id');
       assert.deepEqual(orderCall.options, { ascending: false });
       const limitCall = supabase.calls.find(call => call.method === 'limit');
       assert.equal(limitCall.value, 200);
@@ -652,7 +696,7 @@ test('GET /chat/history 复用鉴权、session 映射并安全返回正序历史
   });
 });
 
-test('稳定传递 session，读取最近历史并把 ai 转为 assistant', async () => {
+test('Gateway 历史在相同 created_at 下按 id 保持多轮正序', async () => {
   const conversationId = '550e8400-e29b-41d4-a716-446655440000';
   const supabaseSessionId = toSupabaseSessionId(conversationId);
   const supabase = createFakeSupabase({
@@ -663,11 +707,38 @@ test('稳定传递 session，读取最近历史并把 ai 转为 assistant', asyn
       session_kind: 'main',
       conversation_id: conversationId
     }],
-    // 模拟数据库按 created_at DESC 返回。
+    // 两轮 user/assistant 的 created_at 各自完全相同，并故意打乱输入。
     history: [
-      { role: 'system', content: '不应传给 Gateway' },
-      { role: 'ai', content: '较新的 AI 回复' },
-      { role: 'user', content: '较早的用户消息' }
+      {
+        id: '204',
+        role: 'ai',
+        content: '第二轮回答',
+        created_at: '2026-08-09T02:00:00.000Z'
+      },
+      {
+        id: '201',
+        role: 'user',
+        content: '第一轮问题',
+        created_at: '2026-08-09T01:00:00.000Z'
+      },
+      {
+        id: '205',
+        role: 'system',
+        content: '不应传给 Gateway',
+        created_at: '2026-08-09T03:00:00.000Z'
+      },
+      {
+        id: '203',
+        role: 'user',
+        content: '第二轮问题',
+        created_at: '2026-08-09T02:00:00.000Z'
+      },
+      {
+        id: '202',
+        role: 'ai',
+        content: '第一轮回答',
+        created_at: '2026-08-09T01:00:00.000Z'
+      }
     ]
   });
   const gatewayCalls = [];
@@ -700,13 +771,20 @@ test('稳定传递 session，读取最近历史并把 ai 转为 assistant', asyn
     assert.equal(gatewayCalls[0].payload.stream, false);
     assert.equal(gatewayCalls[0].payload.model, 'test-model');
     assert.deepEqual(gatewayCalls[0].payload.messages, [
-      { role: 'user', content: '较早的用户消息' },
-      { role: 'assistant', content: '较新的 AI 回复' },
+      { role: 'user', content: '第一轮问题' },
+      { role: 'assistant', content: '第一轮回答' },
+      { role: 'user', content: '第二轮问题' },
+      { role: 'assistant', content: '第二轮回答' },
       { role: 'user', content: '第一轮' }
     ]);
 
-    const orderCall = supabase.calls.find(call => call.method === 'order');
-    assert.deepEqual(orderCall.options, { ascending: false });
+    const orderCalls = supabase.calls.filter(call => call.method === 'order');
+    assert.equal(orderCalls.every(call => call.column === 'id'), true);
+    assert.equal(orderCalls.every(
+      call => JSON.stringify(call.options) === JSON.stringify({ ascending: false })
+    ), true);
+    const limitCalls = supabase.calls.filter(call => call.method === 'limit');
+    assert.equal(limitCalls.every(call => call.value === 20), true);
     const sessionQueries = supabase.calls.filter(
       call => call.method === 'eq' && call.column === 'session_id'
     );
@@ -721,6 +799,64 @@ test('稳定传递 session，读取最近历史并把 ai 转为 assistant', asyn
     ]);
     assert.equal(supabase.calls.some(call => call.table === 'settings'), false);
     assert.equal(gatewayCalls.some(call => call.url.includes('/mcp')), false);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test('Gateway 只读取 id 最大的最近 20 条历史', async () => {
+  const conversationId = '550e8400-e29b-41d4-a716-446655440020';
+  const supabaseSessionId = toSupabaseSessionId(conversationId);
+  const history = Array.from({ length: 25 }, (_, index) => ({
+    id: String(index + 1),
+    role: index % 2 === 0 ? 'user' : 'ai',
+    content: `历史消息 ${index + 1}`,
+    created_at: '2026-08-09T01:00:00.000Z'
+  })).reverse();
+  const supabase = createFakeSupabase({
+    existingSessions: [{
+      id: supabaseSessionId,
+      name: '主聊天',
+      user_id: baseEnv.CHAT_ALLOWED_USER_ID,
+      session_kind: 'main',
+      conversation_id: conversationId
+    }],
+    history
+  });
+  let gatewayPayload;
+  const server = await startTestServer({
+    env: baseEnv,
+    supabaseClient: supabase,
+    gatewayFetch: async (url, options) => {
+      gatewayPayload = JSON.parse(options.body);
+      return response(200, {
+        choices: [{ message: { role: 'assistant', content: '模拟回复' } }]
+      });
+    }
+  });
+
+  try {
+    const result = await request(server, '/chat', {
+      method: 'POST',
+      body: { message: '当前消息' }
+    });
+
+    assert.equal(result.status, 200);
+    assert.equal(gatewayPayload.messages.length, 21);
+    assert.deepEqual(
+      gatewayPayload.messages.slice(0, 20).map(message => message.content),
+      Array.from({ length: 20 }, (_, index) => `历史消息 ${index + 6}`)
+    );
+    assert.deepEqual(gatewayPayload.messages[20], {
+      role: 'user',
+      content: '当前消息'
+    });
+
+    const orderCall = supabase.calls.find(call => call.method === 'order');
+    assert.equal(orderCall.column, 'id');
+    assert.deepEqual(orderCall.options, { ascending: false });
+    const limitCall = supabase.calls.find(call => call.method === 'limit');
+    assert.equal(limitCall.value, 20);
   } finally {
     await closeServer(server);
   }
