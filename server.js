@@ -550,7 +550,8 @@ function createApp(options = {}) {
         .select('role, content, created_at')
         .eq('session_id', session.databaseId)
         .eq('visible', true)
-        .order('created_at', { ascending: false })
+        // 同一次批量 insert 的 created_at 可能相同；用自增 id 稳定选取最近消息。
+        .order('id', { ascending: false })
         .limit(chatHistoryMaxMessages);
 
       if (error) {
@@ -587,14 +588,14 @@ function createApp(options = {}) {
       const config = gatewayChatConfig();
       const session = await resolveRequestSession(req);
 
-      // Supabase 仅保存 CC Home 界面历史；取最近 20 条后恢复时间正序。
+      // Supabase 仅保存 CC Home 界面历史；按自增 id 取最近 20 条后恢复正序。
       const { data: history, error: historyError } = session.persist
         ? await supabase
           .from('messages')
           .select('role, content')
           .eq('session_id', session.databaseId)
           .eq('visible', true)
-          .order('created_at', { ascending: false })
+          .order('id', { ascending: false })
           .limit(20)
         : { data: [], error: null };
 
