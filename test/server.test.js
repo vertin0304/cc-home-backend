@@ -19,6 +19,12 @@ const securityMigrationPath = path.join(
   'migrations',
   '20260815_secure_public_tables.sql'
 );
+const chatRequestsMigrationPath = path.join(
+  __dirname,
+  '..',
+  'migrations',
+  '20260815_add_chat_requests.sql'
+);
 
 const baseEnv = {
   NODE_ENV: 'production',
@@ -45,6 +51,42 @@ function response(status, body) {
   };
 }
 
+function assertSuccessfulChatResponse(result, reply) {
+  assert.equal(result.status, 200);
+  assert.equal(result.body.reply, reply);
+  assert.match(result.body.request_id, /^[0-9a-f-]{36}$/i);
+  assert.equal(result.headers['x-request-id'], result.body.request_id);
+  assert.equal(result.body.diagnostics.schema_version, 1);
+  assert.equal(result.body.diagnostics.status, 'success');
+  assert.equal(result.body.diagnostics.total_duration_ms >= 0, true);
+}
+
+function diagnosticFixture(overrides = {}) {
+  return {
+    schema_version: 1,
+    status: 'success',
+    total_duration_ms: 42,
+    stages: Object.fromEntries([
+      'authentication',
+      'main_session',
+      'history',
+      'gateway',
+      'message_save'
+    ].map(name => [name, { status: 'success', duration_ms: 1 }])),
+    usage: {
+      input_tokens: 100,
+      output_tokens: 20,
+      total_tokens: 120,
+      cached_tokens: 50,
+      prompt_cache_hit_tokens: null,
+      prompt_cache_miss_tokens: null,
+      cache_read_input_tokens: null,
+      cache_creation_input_tokens: null
+    },
+    ...overrides
+  };
+}
+
 function compareQueryValues(left, right) {
   const leftValue = String(left);
   const rightValue = String(right);
@@ -62,18 +104,25 @@ function createFakeSupabase(options = {}) {
   const sessions = new Map(
     (options.existingSessions || []).map(session => [String(session.id), { ...session }])
   );
+  const messages = (options.history || []).map(message => ({ ...message }));
+  const chatRequests = new Map(
+    (options.chatRequests || []).map(item => [String(item.request_id), { ...item }])
+  );
 
   return {
     calls,
     inserts,
     sessions,
+    messages,
+    chatRequests,
     from(table) {
       calls.push({ method: 'from', table });
       const queryState = {
         filters: [],
         limit: null,
         order: null,
-        select: null
+        select: null,
+        inFilters: []
       };
 
       function execute(single = false) {
@@ -94,11 +143,18 @@ function createFakeSupabase(options = {}) {
           return Promise.resolve({ data: rows, error: null });
         }
 
-        let rows = [...(options.history || [])];
+        let rows = table === 'chat_requests'
+          ? [...chatRequests.values()]
+          : [...messages];
         for (const filter of queryState.filters) {
           if (rows.some(row => Object.hasOwn(row, filter.column))) {
             rows = rows.filter(row => String(row[filter.column]) === String(filter.value));
           }
+        }
+        for (const filter of queryState.inFilters) {
+          rows = rows.filter(row => filter.values.some(
+            value => String(row[filter.column]) === String(value)
+          ));
         }
         if (queryState.order && rows.every(row => row[queryState.order.column])) {
           const direction = queryState.order.options?.ascending ? 1 : -1;
@@ -110,7 +166,9 @@ function createFakeSupabase(options = {}) {
         if (queryState.limit !== null) rows = rows.slice(0, queryState.limit);
         return Promise.resolve({
           data: rows,
-          error: options.historyError || options.testDbError || null
+          error: table === 'chat_requests'
+            ? options.diagnosticQueryError || null
+            : options.historyError || options.testDbError || null
         });
       }
 
@@ -123,6 +181,11 @@ function createFakeSupabase(options = {}) {
         eq(column, value) {
           calls.push({ method: 'eq', table, column, value });
           queryState.filters.push({ column, value });
+          return query;
+        },
+        in(column, values) {
+          calls.push({ method: 'in', table, column, values });
+          queryState.inFilters.push({ column, values });
           return query;
         },
         order(column, orderOptions) {
@@ -167,6 +230,20 @@ function createFakeSupabase(options = {}) {
             sessions.set(key, { ...rows });
             return Promise.resolve({ error: null });
           }
+          if (table === 'chat_requests') {
+            if (typeof options.onDiagnosticInsert === 'function') {
+              const result = options.onDiagnosticInsert(rows, chatRequests);
+              if (result) return Promise.resolve(result);
+            }
+            if (options.diagnosticInsertError) {
+              return Promise.resolve({ error: options.diagnosticInsertError });
+            }
+            chatRequests.set(String(rows.request_id), { ...rows });
+            return Promise.resolve({ error: null });
+          }
+          if (Array.isArray(rows) && !options.insertError) {
+            messages.push(...rows.map(row => ({ ...row })));
+          }
           return Promise.resolve({ error: options.insertError || null });
         }
       };
@@ -176,9 +253,14 @@ function createFakeSupabase(options = {}) {
 }
 
 async function startTestServer(options) {
+  let requestSequence = 0;
   const app = createApp({
     ...options,
     randomUUID: options.randomUUID || (() => 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'),
+    requestIdFactory: options.requestIdFactory || (() => {
+      requestSequence += 1;
+      return `bbbbbbbb-bbbb-4bbb-8bbb-${requestSequence.toString(16).padStart(12, '0')}`;
+    }),
     supabaseAuth: options.supabaseAuth || {
       async getUser() {
         return {
@@ -296,6 +378,27 @@ test('公开表安全 migration 启用 RLS 并只保留 service_role 数据权�
   assert.doesNotMatch(sql, /^\s*drop\s+(table|index|constraint)\s+/im);
 });
 
+test('聊天诊断 migration 安全创建服务端表并保留旧消息', () => {
+  const sql = fs.readFileSync(chatRequestsMigrationPath, 'utf8');
+
+  assert.match(sql, /add column request_id uuid null/i);
+  assert.match(sql, /create table public\.chat_requests/i);
+  assert.match(sql, /request_id uuid primary key/i);
+  assert.match(sql, /session_id bigint null references public\.sessions\(id\)/i);
+  assert.match(sql, /diagnostics jsonb not null/i);
+  assert.match(sql, /alter table public\.chat_requests enable row level security/i);
+  assert.match(
+    sql,
+    /revoke all privileges on table public\.chat_requests from public, anon, authenticated/i
+  );
+  assert.match(
+    sql,
+    /grant select, insert, update, delete on table public\.chat_requests to service_role/i
+  );
+  assert.doesNotMatch(sql, /create\s+policy/i);
+  assert.doesNotMatch(sql, /^\s*(update|delete\s+from|truncate)\s+/im);
+});
+
 test('/chat 区分 Supabase 用户 JWT 与内部烟测凭证', async t => {
   async function runChat({
     headers,
@@ -341,6 +444,11 @@ test('/chat 区分 Supabase 用户 JWT 与内部烟测凭证', async t => {
     assert.equal(result.status, 401);
     assert.equal(gatewayCalls, 0);
     assert.equal(supabase.calls.length, 0);
+    assert.match(result.body.request_id, /^[0-9a-f-]{36}$/i);
+    assert.equal(result.headers['x-request-id'], result.body.request_id);
+    assert.equal(result.body.error_stage, 'authentication');
+    assert.equal(result.body.error_code, 'authentication_failed');
+    assert.equal(Object.hasOwn(result.body, 'diagnostics'), false);
     assert.equal(JSON.stringify(result.body).includes('chat-test-token'), false);
   });
 
@@ -423,8 +531,7 @@ test('/chat 区分 Supabase 用户 JWT 与内部烟测凭证', async t => {
         error: null
       })
     });
-    assert.equal(result.status, 200);
-    assert.deepEqual(result.body, { reply: '鉴权通过' });
+    assertSuccessfulChatResponse(result, '鉴权通过');
     assert.equal(gatewayCalls, 1);
     assert.equal(supabase.inserts.some(rows => Array.isArray(rows)), true);
     assert.deepEqual(verifiedTokens, ['valid-user-jwt']);
@@ -678,7 +785,7 @@ test('GET /chat/history 复用鉴权、session 映射并安全返回正序历史
       const selectCall = supabase.calls.find(
         call => call.method === 'select' && call.table === 'messages'
       );
-      assert.equal(selectCall.columns, 'role, content, created_at');
+      assert.equal(selectCall.columns, 'role, content, created_at, request_id');
       const sessionQuery = supabase.calls.find(
         call => call.method === 'eq' && call.column === 'session_id'
       );
@@ -790,9 +897,8 @@ test('Gateway 历史在相同 created_at 下按 id 保持多轮正序', async ()
       body: { message: '第二轮' }
     });
 
-    assert.equal(first.status, 200);
-    assert.deepEqual(first.body, { reply: '模拟回复' });
-    assert.equal(second.status, 200);
+    assertSuccessfulChatResponse(first, '模拟回复');
+    assertSuccessfulChatResponse(second, '模拟回复');
     assert.equal(gatewayCalls.length, 2);
     assert.equal(gatewayCalls[0].url, 'https://gateway.invalid/v1/chat/completions');
     assert.equal(gatewayCalls[0].options.headers.Authorization, 'Bearer gateway-test-token');
@@ -822,10 +928,16 @@ test('Gateway 历史在相同 created_at 下按 id 保持多轮正序', async ()
       supabaseSessionId,
       supabaseSessionId
     ]);
-    assert.equal(supabase.inserts.length, 2);
-    assert.deepEqual(supabase.inserts[0], [
+    const messageInserts = supabase.inserts.filter(rows => Array.isArray(rows));
+    assert.equal(messageInserts.length, 2);
+    assert.deepEqual(messageInserts[0], [
       { session_id: supabaseSessionId, role: 'user', content: '第一轮' },
-      { session_id: supabaseSessionId, role: 'ai', content: '模拟回复' }
+      {
+        session_id: supabaseSessionId,
+        role: 'ai',
+        content: '模拟回复',
+        request_id: first.body.request_id
+      }
     ]);
     assert.equal(supabase.calls.some(call => call.table === 'settings'), false);
     assert.equal(gatewayCalls.some(call => call.url.includes('/mcp')), false);
@@ -920,7 +1032,12 @@ test('按已验证用户幂等解析或创建唯一 main session', async t => {
       assert.deepEqual(supabase.inserts[0], expectedSession);
       assert.deepEqual(supabase.inserts[1], [
         { session_id: supabaseSessionId, role: 'user', content: '新会话' },
-        { session_id: supabaseSessionId, role: 'ai', content: '已回复' }
+        {
+          session_id: supabaseSessionId,
+          role: 'ai',
+          content: '已回复',
+          request_id: result.body.request_id
+        }
       ]);
 
       const sessionInsertIndex = supabase.calls.findIndex(
@@ -1003,7 +1120,7 @@ test('按已验证用户幂等解析或创建唯一 main session', async t => {
       });
 
       assert.deepEqual(supabase.sessions.get(supabaseSessionId), existingSession);
-      assert.equal(supabase.inserts.length, 1);
+      assert.equal(supabase.inserts.filter(rows => Array.isArray(rows)).length, 1);
     } finally {
       await closeServer(server);
     }
@@ -1212,12 +1329,295 @@ test('历史读取失败时仍可对话，保存返回 error 时不会吞掉回�
       method: 'POST',
       body: { message: '继续聊天' }
     });
-    assert.equal(result.status, 200);
-    assert.deepEqual(result.body, { reply: '仍然回复' });
+    assertSuccessfulChatResponse(result, '仍然回复');
     assert.equal(errors.some(args => args[0] === '加载历史消息失败'), true);
     assert.equal(errors.some(args => args[0] === '保存消息失败'), true);
     assert.equal(JSON.stringify(errors).includes('继续聊天'), false);
     assert.equal(JSON.stringify(errors).includes('chat-test-token'), false);
+  } finally {
+    console.error = originalError;
+    await closeServer(server);
+  }
+});
+
+test('/chat 诊断只保存 Gateway 实际 usage 并记录各阶段', async t => {
+  const conversationId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+  const sessionId = toSupabaseSessionId(conversationId);
+  const existingSession = {
+    id: sessionId,
+    name: '主聊天',
+    user_id: baseEnv.CHAT_ALLOWED_USER_ID,
+    session_kind: 'main',
+    conversation_id: conversationId
+  };
+
+  await t.test('保存白名单 usage、request_id、状态和耗时', async () => {
+    const requestId = '22222222-2222-4222-8222-222222222222';
+    const supabase = createFakeSupabase({ existingSessions: [existingSession] });
+    const server = await startTestServer({
+      env: baseEnv,
+      supabaseClient: supabase,
+      requestIdFactory: () => requestId,
+      gatewayFetch: async () => response(200, {
+        choices: [{ message: { content: '带诊断的回复' } }],
+        usage: {
+          prompt_tokens: 321,
+          completion_tokens: 45,
+          total_tokens: 366,
+          prompt_tokens_details: { cached_tokens: 123, secret: '不应保存' },
+          prompt_cache_hit_tokens: 124,
+          prompt_cache_miss_tokens: 197,
+          cache_read_input_tokens: 120,
+          cache_creation_input_tokens: 3,
+          upstream_secret: '不应保存'
+        }
+      })
+    });
+
+    try {
+      const result = await request(server, '/chat', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer sensitive-user-jwt' },
+        body: { message: '不应进入诊断的消息正文' }
+      });
+
+      assertSuccessfulChatResponse(result, '带诊断的回复');
+      assert.equal(result.body.request_id, requestId);
+      assert.deepEqual(result.body.diagnostics.usage, {
+        input_tokens: 321,
+        output_tokens: 45,
+        total_tokens: 366,
+        cached_tokens: 123,
+        prompt_cache_hit_tokens: 124,
+        prompt_cache_miss_tokens: 197,
+        cache_read_input_tokens: 120,
+        cache_creation_input_tokens: 3
+      });
+      for (const stage of Object.values(result.body.diagnostics.stages)) {
+        assert.equal(stage.status, 'success');
+        assert.equal(typeof stage.duration_ms, 'number');
+        assert.equal(stage.duration_ms >= 0, true);
+      }
+
+      const stored = supabase.chatRequests.get(requestId);
+      assert.equal(stored.session_id, sessionId);
+      assert.equal(stored.status, 'success');
+      assert.equal(stored.error_stage, null);
+      assert.deepEqual(stored.diagnostics, result.body.diagnostics);
+      const serialized = JSON.stringify(stored);
+      assert.equal(serialized.includes('sensitive-user-jwt'), false);
+      assert.equal(serialized.includes('不应进入诊断的消息正文'), false);
+      assert.equal(serialized.includes('不应保存'), false);
+
+      const savedMessages = supabase.inserts.find(rows => Array.isArray(rows));
+      assert.equal(savedMessages[0].request_id, undefined);
+      assert.equal(savedMessages[1].request_id, requestId);
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  await t.test('缺失和无效 usage 保持 null，不根据已有字段补算', async () => {
+    const supabase = createFakeSupabase({ existingSessions: [existingSession] });
+    const server = await startTestServer({
+      env: baseEnv,
+      supabaseClient: supabase,
+      gatewayFetch: async () => response(200, {
+        choices: [{ message: { content: '部分 usage' } }],
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 5,
+          total_tokens: '15',
+          prompt_tokens_details: { cached_tokens: '4' },
+          cache_read_input_tokens: -1
+        }
+      })
+    });
+
+    try {
+      const result = await request(server, '/chat', {
+        method: 'POST',
+        body: { message: 'usage 不补算' }
+      });
+      assert.equal(result.body.diagnostics.usage.input_tokens, 10);
+      assert.equal(result.body.diagnostics.usage.output_tokens, 5);
+      assert.equal(result.body.diagnostics.usage.total_tokens, null);
+      assert.equal(result.body.diagnostics.usage.cached_tokens, null);
+      assert.equal(result.body.diagnostics.usage.cache_read_input_tokens, null);
+      assert.equal(result.body.diagnostics.usage.cache_creation_input_tokens, null);
+    } finally {
+      await closeServer(server);
+    }
+  });
+});
+
+test('聊天诊断保存失败不影响回复或消息保存', async () => {
+  const conversationId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+  const sessionId = toSupabaseSessionId(conversationId);
+  const sensitiveError = 'database secret gateway-test-token';
+  const supabase = createFakeSupabase({
+    existingSessions: [{
+      id: sessionId,
+      name: '主聊天',
+      user_id: baseEnv.CHAT_ALLOWED_USER_ID,
+      session_kind: 'main',
+      conversation_id: conversationId
+    }],
+    diagnosticInsertError: new Error(sensitiveError)
+  });
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => errors.push(args);
+  const server = await startTestServer({
+    env: baseEnv,
+    supabaseClient: supabase,
+    gatewayFetch: async () => response(200, {
+      choices: [{ message: { content: '回复仍成功' } }]
+    })
+  });
+
+  try {
+    const result = await request(server, '/chat', {
+      method: 'POST',
+      body: { message: '消息仍保存' }
+    });
+    assertSuccessfulChatResponse(result, '回复仍成功');
+    assert.equal(supabase.inserts.some(rows => Array.isArray(rows)), true);
+    assert.equal(supabase.chatRequests.size, 0);
+    assert.equal(errors.some(args => args[0] === '保存聊天诊断失败'), true);
+    assert.equal(JSON.stringify(errors).includes(sensitiveError), false);
+  } finally {
+    console.error = originalError;
+    await closeServer(server);
+  }
+});
+
+test('/chat/history 为成功 assistant 附加脱敏诊断并兼容旧消息', async () => {
+  const conversationId = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+  const sessionId = toSupabaseSessionId(conversationId);
+  const requestId = '33333333-3333-4333-8333-333333333333';
+  const diagnostics = diagnosticFixture({ secret: '不应返回' });
+  diagnostics.stages.gateway.prompt = '不应返回';
+  diagnostics.usage.provider_detail = '不应返回';
+  const supabase = createFakeSupabase({
+    existingSessions: [{
+      id: sessionId,
+      name: '主聊天',
+      user_id: baseEnv.CHAT_ALLOWED_USER_ID,
+      session_kind: 'main',
+      conversation_id: conversationId
+    }],
+    history: [
+      {
+        id: '3',
+        session_id: sessionId,
+        role: 'ai',
+        content: '带详情回复',
+        created_at: '2026-08-15T02:00:00.000Z',
+        visible: true,
+        request_id: requestId
+      },
+      {
+        id: '2',
+        session_id: sessionId,
+        role: 'ai',
+        content: '旧回复',
+        created_at: '2026-08-15T01:00:01.000Z',
+        visible: true,
+        request_id: null
+      },
+      {
+        id: '1',
+        session_id: sessionId,
+        role: 'user',
+        content: '旧问题',
+        created_at: '2026-08-15T01:00:00.000Z',
+        visible: true,
+        request_id: null
+      }
+    ],
+    chatRequests: [{
+      request_id: requestId,
+      session_id: sessionId,
+      status: 'success',
+      diagnostics
+    }]
+  });
+  const server = await startTestServer({
+    env: baseEnv,
+    supabaseClient: supabase,
+    gatewayFetch: async () => response(200, {})
+  });
+
+  try {
+    const result = await request(server, '/chat/history');
+    assert.equal(result.status, 200);
+    assert.equal(result.body.messages.length, 3);
+    assert.equal(Object.hasOwn(result.body.messages[1], 'diagnostics'), false);
+    assert.equal(result.body.messages[2].request_id, requestId);
+    assert.deepEqual(result.body.messages[2].diagnostics, diagnosticFixture());
+    assert.equal(JSON.stringify(result.body).includes('不应返回'), false);
+
+    const diagnosticQuery = supabase.calls.find(
+      call => call.method === 'in' && call.table === 'chat_requests'
+    );
+    assert.deepEqual(diagnosticQuery.values, [requestId]);
+    assert.equal(supabase.calls.some(
+      call => call.method === 'eq'
+        && call.table === 'chat_requests'
+        && call.column === 'session_id'
+        && call.value === sessionId
+    ), true);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test('/chat/history 诊断查询失败时仍返回消息正文', async () => {
+  const conversationId = 'abababab-abab-4bab-8bab-abababababab';
+  const sessionId = toSupabaseSessionId(conversationId);
+  const requestId = '44444444-4444-4444-8444-444444444444';
+  const sensitiveError = 'diagnostic secret gateway-test-token';
+  const supabase = createFakeSupabase({
+    existingSessions: [{
+      id: sessionId,
+      name: '主聊天',
+      user_id: baseEnv.CHAT_ALLOWED_USER_ID,
+      session_kind: 'main',
+      conversation_id: conversationId
+    }],
+    history: [{
+      id: '1',
+      session_id: sessionId,
+      role: 'ai',
+      content: '历史回复仍可读',
+      created_at: '2026-08-15T03:00:00.000Z',
+      visible: true,
+      request_id: requestId
+    }],
+    diagnosticQueryError: new Error(sensitiveError)
+  });
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => errors.push(args);
+  const server = await startTestServer({
+    env: baseEnv,
+    supabaseClient: supabase,
+    gatewayFetch: async () => response(200, {})
+  });
+
+  try {
+    const result = await request(server, '/chat/history');
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.body, {
+      messages: [{
+        role: 'assistant',
+        content: '历史回复仍可读',
+        createdAt: '2026-08-15T03:00:00.000Z'
+      }]
+    });
+    assert.deepEqual(errors, [['加载聊天诊断失败']]);
+    assert.equal(JSON.stringify(errors).includes(sensitiveError), false);
   } finally {
     console.error = originalError;
     await closeServer(server);
@@ -1240,8 +1640,16 @@ test('Gateway 非成功响应和无效响应都返回安全错误且不保存消
         body: { message: '测试' }
       });
       assert.equal(result.status, 502);
+      assert.match(result.body.request_id, /^[0-9a-f-]{36}$/i);
+      assert.equal(result.body.error_stage, 'gateway');
+      assert.equal(result.body.error_code, 'gateway_unavailable');
+      assert.equal(Object.hasOwn(result.body, 'diagnostics'), false);
       assert.equal(JSON.stringify(result.body).includes('不应泄露'), false);
       assert.equal(supabase.inserts.some(rows => Array.isArray(rows)), false);
+      const diagnostic = supabase.chatRequests.get(result.body.request_id);
+      assert.equal(diagnostic.status, 'error');
+      assert.equal(diagnostic.error_stage, 'gateway');
+      assert.equal(diagnostic.error_code, 'gateway_unavailable');
     } finally {
       console.error = originalError;
       await closeServer(server);

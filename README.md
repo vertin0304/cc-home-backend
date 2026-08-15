@@ -42,6 +42,24 @@ Gateway session。客户端提交 `sessionId` 会被拒绝，也不会收到服�
 响应角色只包含 `user` 和 `assistant`，不会返回数据库 session ID 或其他内部字段。
 前端刷新后应通过该接口恢复消息，不应把消息正文保存到 `localStorage`。
 
+## 聊天诊断（第一阶段）
+
+`POST /chat` 的每次请求都由后端生成随机 `request_id`。成功响应保留 `reply`，并增加
+`request_id` 与脱敏 `diagnostics`；错误响应增加 `request_id`、`error_stage` 和
+`error_code`，不返回原始上游错误、凭证、请求头、消息正文、提示词或记忆正文。
+
+诊断记录鉴权、主会话、最近历史、Gateway 往返和消息保存的状态与毫秒耗时。Usage
+只接受 Gateway 响应中实际存在的非负安全整数；缺失或无效字段为 `null`，服务端不估算、
+不根据输入输出补算总 token，也不推测缓存命中。
+
+迁移 `migrations/20260815_add_chat_requests.sql` 创建仅供 service role 使用的
+`chat_requests` 表，并为成功 assistant 消息增加 nullable `messages.request_id`。
+现有消息保持 `NULL`。`GET /chat/history` 会为能够安全关联的成功 assistant 消息附加
+已有诊断；旧消息和旧客户端保持兼容。诊断保存或读取失败不会阻止聊天和历史正文返回。
+
+必须先执行 additive migration，再部署读取 `messages.request_id` 的后端版本；本仓库不会
+自动连接或修改线上 Supabase。
+
 ## 单用户限制
 
 迁移 `migrations/20260809_add_owned_main_sessions.sql` 为 `sessions` 增加 nullable 的
