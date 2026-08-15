@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const net = require('net');
+const { performance } = require('node:perf_hooks');
 const { createClient } = require('@supabase/supabase-js');
 
 function positiveInteger(value, fallback) {
@@ -91,6 +92,93 @@ function isUuid(value) {
     && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
+const CHAT_DIAGNOSTIC_STAGE_NAMES = [
+  'authentication',
+  'main_session',
+  'history',
+  'gateway',
+  'message_save'
+];
+const CHAT_DIAGNOSTIC_STAGE_STATUSES = new Set([
+  'not_started',
+  'success',
+  'failure',
+  'degraded',
+  'skipped'
+]);
+
+function nonNegativeSafeInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function normalizeGatewayUsage(data) {
+  const usage = data && typeof data.usage === 'object' && data.usage !== null
+    ? data.usage
+    : {};
+  const promptDetails = usage.prompt_tokens_details
+    && typeof usage.prompt_tokens_details === 'object'
+    ? usage.prompt_tokens_details
+    : {};
+
+  return {
+    input_tokens: nonNegativeSafeInteger(usage.prompt_tokens)
+      ?? nonNegativeSafeInteger(usage.input_tokens),
+    output_tokens: nonNegativeSafeInteger(usage.completion_tokens)
+      ?? nonNegativeSafeInteger(usage.output_tokens),
+    total_tokens: nonNegativeSafeInteger(usage.total_tokens),
+    cached_tokens: nonNegativeSafeInteger(promptDetails.cached_tokens),
+    prompt_cache_hit_tokens: nonNegativeSafeInteger(usage.prompt_cache_hit_tokens),
+    prompt_cache_miss_tokens: nonNegativeSafeInteger(usage.prompt_cache_miss_tokens),
+    cache_read_input_tokens: nonNegativeSafeInteger(usage.cache_read_input_tokens),
+    cache_creation_input_tokens: nonNegativeSafeInteger(usage.cache_creation_input_tokens)
+  };
+}
+
+function normalizeStoredDiagnostics(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const stages = {};
+  const sourceStages = value.stages && typeof value.stages === 'object'
+    ? value.stages
+    : {};
+  for (const name of CHAT_DIAGNOSTIC_STAGE_NAMES) {
+    const source = sourceStages[name] && typeof sourceStages[name] === 'object'
+      ? sourceStages[name]
+      : {};
+    stages[name] = {
+      status: CHAT_DIAGNOSTIC_STAGE_STATUSES.has(source.status)
+        ? source.status
+        : 'not_started',
+      duration_ms: typeof source.duration_ms === 'number'
+        && Number.isFinite(source.duration_ms)
+        && source.duration_ms >= 0
+        ? source.duration_ms
+        : null
+    };
+  }
+
+  const usage = value.usage && typeof value.usage === 'object' ? value.usage : {};
+  return {
+    schema_version: 1,
+    status: value.status === 'error' ? 'error' : 'success',
+    total_duration_ms: typeof value.total_duration_ms === 'number'
+      && Number.isFinite(value.total_duration_ms)
+      && value.total_duration_ms >= 0
+      ? value.total_duration_ms
+      : null,
+    stages,
+    usage: {
+      input_tokens: nonNegativeSafeInteger(usage.input_tokens),
+      output_tokens: nonNegativeSafeInteger(usage.output_tokens),
+      total_tokens: nonNegativeSafeInteger(usage.total_tokens),
+      cached_tokens: nonNegativeSafeInteger(usage.cached_tokens),
+      prompt_cache_hit_tokens: nonNegativeSafeInteger(usage.prompt_cache_hit_tokens),
+      prompt_cache_miss_tokens: nonNegativeSafeInteger(usage.prompt_cache_miss_tokens),
+      cache_read_input_tokens: nonNegativeSafeInteger(usage.cache_read_input_tokens),
+      cache_creation_input_tokens: nonNegativeSafeInteger(usage.cache_creation_input_tokens)
+    }
+  };
+}
+
 // PostgreSQL bigint 的正数高位区间用于字符串 session 的确定性映射。
 // 以十进制字符串交给 PostgREST，避免 JavaScript Number 丢失 64 位整数精度。
 const POSTGRES_BIGINT_MAX = 9_223_372_036_854_775_807n;
@@ -132,7 +220,7 @@ function normalizeHistory(history) {
     .map(item => ({ role: roleMap[item.role], content: item.content }));
 }
 
-function normalizeClientHistory(history) {
+function normalizeClientHistory(history, diagnosticsByRequestId = new Map()) {
   const roleMap = {
     user: 'user',
     ai: 'assistant',
@@ -143,11 +231,22 @@ function normalizeClientHistory(history) {
     .slice()
     .reverse()
     .filter(item => item && roleMap[item.role] && typeof item.content === 'string')
-    .map(item => ({
-      role: roleMap[item.role],
-      content: item.content,
-      createdAt: typeof item.created_at === 'string' ? item.created_at : null
-    }));
+    .map(item => {
+      const normalized = {
+        role: roleMap[item.role],
+        content: item.content,
+        createdAt: typeof item.created_at === 'string' ? item.created_at : null
+      };
+      const requestId = isUuid(item.request_id) ? item.request_id : null;
+      const diagnostics = requestId
+        ? normalizeStoredDiagnostics(diagnosticsByRequestId.get(requestId))
+        : null;
+      if (normalized.role === 'assistant' && requestId && diagnostics) {
+        normalized.request_id = requestId;
+        normalized.diagnostics = diagnostics;
+      }
+      return normalized;
+    });
 }
 
 function createApp(options = {}) {
@@ -160,6 +259,9 @@ function createApp(options = {}) {
   );
   const supabaseAuth = options.supabaseAuth || supabase.auth;
   const randomUUID = options.randomUUID || crypto.randomUUID;
+  const requestIdFactory = options.requestIdFactory || crypto.randomUUID;
+  const monotonicNow = options.monotonicNow || (() => performance.now());
+  const wallClockNow = options.wallClockNow || (() => new Date());
 
   if (typeof gatewayFetch !== 'function') {
     throw new Error('当前 Node.js 环境不支持 fetch');
@@ -167,6 +269,118 @@ function createApp(options = {}) {
 
   const app = express();
   app.set('trust proxy', 1);
+
+  function newDiagnosticStages() {
+    return Object.fromEntries(CHAT_DIAGNOSTIC_STAGE_NAMES.map(name => [name, {
+      status: 'not_started',
+      duration_ms: null
+    }]));
+  }
+
+  function startDiagnosticStage(req, name) {
+    const diagnostic = req.chatDiagnostic;
+    const stage = diagnostic?.stages?.[name];
+    if (!stage || stage.status !== 'not_started') return;
+    stage.status = 'running';
+    stage.started_ms = monotonicNow();
+  }
+
+  function finishDiagnosticStage(req, name, status) {
+    const stage = req.chatDiagnostic?.stages?.[name];
+    if (!stage || !CHAT_DIAGNOSTIC_STAGE_STATUSES.has(status)) return;
+    if (stage.status === 'running' && typeof stage.started_ms === 'number') {
+      stage.duration_ms = Math.max(0, Math.round((monotonicNow() - stage.started_ms) * 100) / 100);
+    } else if (stage.duration_ms === null && status === 'skipped') {
+      stage.duration_ms = 0;
+    }
+    delete stage.started_ms;
+    stage.status = status;
+  }
+
+  function failRunningDiagnosticStages(req) {
+    for (const name of CHAT_DIAGNOSTIC_STAGE_NAMES) {
+      if (req.chatDiagnostic?.stages?.[name]?.status === 'running') {
+        finishDiagnosticStage(req, name, 'failure');
+      }
+    }
+  }
+
+  async function persistChatDiagnostic(req, status, errorStage, errorCode) {
+    const diagnostic = req.chatDiagnostic;
+    if (!diagnostic || diagnostic.completed) return diagnostic?.publicPayload || null;
+
+    failRunningDiagnosticStages(req);
+    diagnostic.completed = true;
+    const completedAt = wallClockNow();
+    const totalDurationMs = Math.max(
+      0,
+      Math.round((monotonicNow() - diagnostic.started_ms) * 100) / 100
+    );
+    const publicPayload = normalizeStoredDiagnostics({
+      schema_version: 1,
+      status,
+      total_duration_ms: totalDurationMs,
+      stages: diagnostic.stages,
+      usage: diagnostic.usage
+    });
+    diagnostic.publicPayload = publicPayload;
+
+    // 未通过鉴权、尚未解析主会话及内部烟测都没有 owned session，不写入诊断表。
+    if (diagnostic.session_id === null) return publicPayload;
+
+    try {
+      const { error } = await supabase.from('chat_requests').insert({
+        request_id: diagnostic.request_id,
+        session_id: diagnostic.session_id,
+        status,
+        error_stage: errorStage,
+        error_code: errorCode,
+        diagnostics: publicPayload,
+        started_at: diagnostic.started_at,
+        completed_at: completedAt.toISOString()
+      });
+      if (error) console.error('保存聊天诊断失败');
+    } catch {
+      console.error('保存聊天诊断失败');
+    }
+    return publicPayload;
+  }
+
+  async function sendChatError(req, res, status, error, stage, code, reply) {
+    if (!req.chatDiagnostic) {
+      return res.status(status).json(reply === undefined ? { error } : { error, reply });
+    }
+    await persistChatDiagnostic(req, 'error', stage, code);
+    const body = {
+      error,
+      request_id: req.chatDiagnostic.request_id,
+      error_stage: stage,
+      error_code: code
+    };
+    if (reply !== undefined) body.reply = reply;
+    return res.status(status).json(body);
+  }
+
+  // 必须早于 CORS、JSON 解析、限流和鉴权，确保每个 POST /chat 都有服务端 request_id。
+  app.use((req, res, next) => {
+    if (req.method === 'POST' && req.path === '/chat') {
+      let requestId = requestIdFactory();
+      if (!isUuid(requestId)) requestId = crypto.randomUUID();
+      const startedAt = wallClockNow();
+      req.chatDiagnostic = {
+        request_id: requestId,
+        started_at: startedAt.toISOString(),
+        started_ms: monotonicNow(),
+        session_id: null,
+        stages: newDiagnosticStages(),
+        usage: normalizeGatewayUsage(null),
+        completed: false,
+        publicPayload: null
+      };
+      res.set('X-Request-Id', requestId);
+    }
+    return next();
+  });
 
   // ---------- CORS 与请求体限制 ----------
   const configuredOrigins = (env.FRONTEND_ORIGIN || '')
@@ -221,18 +435,26 @@ function createApp(options = {}) {
 
   // ---------- 聊天访问验证 ----------
   async function requireChatAccess(req, res, next) {
+    startDiagnosticStage(req, 'authentication');
     // 长期内部烟测凭证使用独立 header，绝不与浏览器 Supabase JWT 混用。
     const internalCandidate = req.get('x-cc-home-internal-token') || '';
     if (internalCandidate) {
       const chatAccessToken = env.CHAT_ACCESS_TOKEN;
       if (!chatAccessToken) {
         console.error('内部聊天烟测不可用：未配置 CHAT_ACCESS_TOKEN');
-        return res.status(503).json({ error: '内部聊天烟测未配置' });
+        finishDiagnosticStage(req, 'authentication', 'failure');
+        return sendChatError(
+          req, res, 503, '内部聊天烟测未配置', 'authentication', 'internal_auth_unavailable'
+        );
       }
       if (!secureTokenEquals(internalCandidate, chatAccessToken)) {
-        return res.status(401).json({ error: '聊天访问验证失败' });
+        finishDiagnosticStage(req, 'authentication', 'failure');
+        return sendChatError(
+          req, res, 401, '聊天访问验证失败', 'authentication', 'authentication_failed'
+        );
       }
       req.chatPrincipal = { type: 'internal' };
+      finishDiagnosticStage(req, 'authentication', 'success');
       return next();
     }
 
@@ -242,7 +464,10 @@ function createApp(options = {}) {
       ? authorization.slice(7).trim()
       : '';
     if (!bearerToken) {
-      return res.status(401).json({ error: '聊天访问验证失败' });
+      finishDiagnosticStage(req, 'authentication', 'failure');
+      return sendChatError(
+        req, res, 401, '聊天访问验证失败', 'authentication', 'authentication_failed'
+      );
     }
 
     const allowedUserId = typeof env.CHAT_ALLOWED_USER_ID === 'string'
@@ -250,11 +475,17 @@ function createApp(options = {}) {
       : '';
     if (!allowedUserId) {
       console.error('聊天接口不可用：未配置 CHAT_ALLOWED_USER_ID');
-      return res.status(503).json({ error: '聊天访问功能未配置' });
+      finishDiagnosticStage(req, 'authentication', 'failure');
+      return sendChatError(
+        req, res, 503, '聊天访问功能未配置', 'authentication', 'authentication_unavailable'
+      );
     }
     if (!supabaseAuth || typeof supabaseAuth.getUser !== 'function') {
       console.error('聊天接口不可用：Supabase Auth 客户端未配置');
-      return res.status(503).json({ error: '聊天访问功能未配置' });
+      finishDiagnosticStage(req, 'authentication', 'failure');
+      return sendChatError(
+        req, res, 503, '聊天访问功能未配置', 'authentication', 'authentication_unavailable'
+      );
     }
 
     try {
@@ -262,16 +493,26 @@ function createApp(options = {}) {
       const { data, error } = await supabaseAuth.getUser(bearerToken);
       const userId = data?.user?.id;
       if (error || typeof userId !== 'string' || !userId) {
-        return res.status(401).json({ error: '聊天访问验证失败' });
+        finishDiagnosticStage(req, 'authentication', 'failure');
+        return sendChatError(
+          req, res, 401, '聊天访问验证失败', 'authentication', 'authentication_failed'
+        );
       }
       if (userId !== allowedUserId) {
-        return res.status(403).json({ error: '无权访问聊天功能' });
+        finishDiagnosticStage(req, 'authentication', 'failure');
+        return sendChatError(
+          req, res, 403, '无权访问聊天功能', 'authentication', 'authentication_forbidden'
+        );
       }
 
       req.chatPrincipal = { type: 'user', userId };
+      finishDiagnosticStage(req, 'authentication', 'success');
       return next();
     } catch {
-      return res.status(401).json({ error: '聊天访问验证失败' });
+      finishDiagnosticStage(req, 'authentication', 'failure');
+      return sendChatError(
+        req, res, 401, '聊天访问验证失败', 'authentication', 'authentication_failed'
+      );
     }
   }
 
@@ -285,7 +526,7 @@ function createApp(options = {}) {
   );
   const chatRateLimits = new Map();
 
-  function chatRateLimit(req, res, next) {
+  async function chatRateLimit(req, res, next) {
     const now = Date.now();
     const key = req.ip || req.socket.remoteAddress || 'unknown';
     let entry = chatRateLimits.get(key);
@@ -308,7 +549,9 @@ function createApp(options = {}) {
 
     if (entry.count > chatRateLimitMax) {
       res.set('Retry-After', String(Math.ceil((entry.resetAt - now) / 1000)));
-      return res.status(429).json({ error: '请求过于频繁，请稍后再试' });
+      return sendChatError(
+        req, res, 429, '请求过于频繁，请稍后再试', 'rate_limit', 'rate_limited'
+      );
     }
     return next();
   }
@@ -547,7 +790,7 @@ function createApp(options = {}) {
       const session = await resolveRequestSession(req);
       const { data, error } = await supabase
         .from('messages')
-        .select('role, content, created_at')
+        .select('role, content, created_at, request_id')
         .eq('session_id', session.databaseId)
         .eq('visible', true)
         // 同一次批量 insert 的 created_at 可能相同；用自增 id 稳定选取最近消息。
@@ -558,7 +801,33 @@ function createApp(options = {}) {
         console.error('加载聊天历史失败');
         return res.status(503).json({ error: '聊天记录暂时不可用' });
       }
-      return res.json({ messages: normalizeClientHistory(data) });
+
+      const requestIds = [...new Set((Array.isArray(data) ? data : [])
+        .filter(item => ['ai', 'assistant'].includes(item?.role) && isUuid(item?.request_id))
+        .map(item => item.request_id))];
+      const diagnosticsByRequestId = new Map();
+      if (requestIds.length > 0) {
+        try {
+          const { data: diagnosticRows, error: diagnosticError } = await supabase
+            .from('chat_requests')
+            .select('request_id, diagnostics')
+            .eq('session_id', session.databaseId)
+            .eq('status', 'success')
+            .in('request_id', requestIds);
+          if (diagnosticError) {
+            console.error('加载聊天诊断失败');
+          } else {
+            for (const row of Array.isArray(diagnosticRows) ? diagnosticRows : []) {
+              if (isUuid(row?.request_id)) {
+                diagnosticsByRequestId.set(row.request_id, row.diagnostics);
+              }
+            }
+          }
+        } catch {
+          console.error('加载聊天诊断失败');
+        }
+      }
+      return res.json({ messages: normalizeClientHistory(data, diagnosticsByRequestId) });
     } catch (error) {
       if (error.code === 'MAIN_SESSION_ERROR') {
         console.error('解析主聊天失败');
@@ -573,22 +842,34 @@ function createApp(options = {}) {
   app.post('/chat', chatRateLimit, requireChatAccess, async (req, res) => {
     const { message, sessionId } = req.body || {};
     if (sessionId !== undefined) {
-      return res.status(400).json({ error: '客户端不能指定主聊天 sessionId' });
+      return sendChatError(
+        req, res, 400, '客户端不能指定主聊天 sessionId', 'request', 'client_session_forbidden'
+      );
     }
     if (typeof message !== 'string' || !message.trim()) {
-      return res.status(400).json({ error: '消息内容不能为空' });
+      return sendChatError(req, res, 400, '消息内容不能为空', 'request', 'invalid_message');
     }
     if (message.length > chatMaxMessageLength) {
-      return res.status(413).json({
-        error: `消息内容不能超过 ${chatMaxMessageLength} 个字符`
-      });
+      return sendChatError(
+        req,
+        res,
+        413,
+        `消息内容不能超过 ${chatMaxMessageLength} 个字符`,
+        'request',
+        'message_too_long'
+      );
     }
 
     try {
       const config = gatewayChatConfig();
+
+      startDiagnosticStage(req, 'main_session');
       const session = await resolveRequestSession(req);
+      req.chatDiagnostic.session_id = session.databaseId;
+      finishDiagnosticStage(req, 'main_session', 'success');
 
       // Supabase 仅保存 CC Home 界面历史；按自增 id 取最近 20 条后恢复正序。
+      startDiagnosticStage(req, 'history');
       const { data: history, error: historyError } = session.persist
         ? await supabase
           .from('messages')
@@ -601,6 +882,11 @@ function createApp(options = {}) {
 
       if (historyError) {
         console.error('加载历史消息失败');
+        finishDiagnosticStage(req, 'history', 'degraded');
+      } else if (session.persist) {
+        finishDiagnosticStage(req, 'history', 'success');
+      } else {
+        finishDiagnosticStage(req, 'history', 'skipped');
       }
 
       const messages = [
@@ -608,6 +894,7 @@ function createApp(options = {}) {
         { role: 'user', content: message }
       ];
 
+      startDiagnosticStage(req, 'gateway');
       const response = await requestGateway('/chat/completions', {
         method: 'POST',
         headers: {
@@ -624,81 +911,157 @@ function createApp(options = {}) {
       });
 
       if (!response.ok) {
+        finishDiagnosticStage(req, 'gateway', 'failure');
         console.error('Gateway 对话请求失败:', { status: response.status });
-        return res.status(502).json({
-          error: '上游服务暂时不可用',
-          reply: '抱歉，我现在有点不在状态，请稍后再试试。'
-        });
+        return sendChatError(
+          req,
+          res,
+          502,
+          '上游服务暂时不可用',
+          'gateway',
+          'gateway_unavailable',
+          '抱歉，我现在有点不在状态，请稍后再试试。'
+        );
       }
 
-      const data = await response.json();
+      let data;
+      try {
+        data = await response.json();
+      } catch {
+        finishDiagnosticStage(req, 'gateway', 'failure');
+        console.error('Gateway 返回格式无效');
+        return sendChatError(
+          req,
+          res,
+          502,
+          '上游服务返回无效',
+          'gateway',
+          'gateway_invalid_response',
+          '抱歉，我现在有点不在状态，请稍后再试试。'
+        );
+      }
+      req.chatDiagnostic.usage = normalizeGatewayUsage(data);
       const reply = data?.choices?.[0]?.message?.content;
       if (typeof reply !== 'string' || !reply.trim()) {
+        finishDiagnosticStage(req, 'gateway', 'failure');
         console.error('Gateway 返回格式无效');
-        return res.status(502).json({
-          error: '上游服务返回无效',
-          reply: '抱歉，我现在有点不在状态，请稍后再试试。'
-        });
+        return sendChatError(
+          req,
+          res,
+          502,
+          '上游服务返回无效',
+          'gateway',
+          'gateway_invalid_response',
+          '抱歉，我现在有点不在状态，请稍后再试试。'
+        );
       }
+      finishDiagnosticStage(req, 'gateway', 'success');
 
+      startDiagnosticStage(req, 'message_save');
       if (session.persist) {
         try {
           const { error: saveError } = await supabase.from('messages').insert([
             { session_id: session.databaseId, role: 'user', content: message },
-            { session_id: session.databaseId, role: 'ai', content: reply }
+            {
+              session_id: session.databaseId,
+              role: 'ai',
+              content: reply,
+              request_id: req.chatDiagnostic.request_id
+            }
           ]);
           if (saveError) {
             console.error('保存消息失败');
+            finishDiagnosticStage(req, 'message_save', 'failure');
+          } else {
+            finishDiagnosticStage(req, 'message_save', 'success');
           }
         } catch {
           console.error('保存消息失败');
+          finishDiagnosticStage(req, 'message_save', 'failure');
         }
+      } else {
+        finishDiagnosticStage(req, 'message_save', 'skipped');
       }
 
-      return res.json({ reply });
+      const diagnostics = await persistChatDiagnostic(req, 'success', null, null);
+      return res.json({
+        reply,
+        request_id: req.chatDiagnostic.request_id,
+        diagnostics
+      });
     } catch (error) {
       if (error.name === 'AbortError') {
+        finishDiagnosticStage(req, 'gateway', 'failure');
         console.error('/chat Gateway 请求超时');
-        return res.status(504).json({
-          error: '上游服务响应超时',
-          reply: '抱歉，回复等得有点久，请稍后再试试。'
-        });
+        return sendChatError(
+          req,
+          res,
+          504,
+          '上游服务响应超时',
+          'gateway',
+          'gateway_timeout',
+          '抱歉，回复等得有点久，请稍后再试试。'
+        );
       }
 
       if (error.code === 'GATEWAY_CONFIG_ERROR') {
         console.error('/chat Gateway 配置错误:', error.message);
-        return res.status(503).json({
-          error: '对话服务尚未配置',
-          reply: '抱歉，对话服务暂时不可用。'
-        });
+        return sendChatError(
+          req,
+          res,
+          503,
+          '对话服务尚未配置',
+          'gateway',
+          'gateway_config_error',
+          '抱歉，对话服务暂时不可用。'
+        );
       }
 
       if (error.code === 'MAIN_SESSION_ERROR') {
+        finishDiagnosticStage(req, 'main_session', 'failure');
         console.error('解析主聊天失败');
-        return res.status(503).json({
-          error: '聊天记录暂时不可用',
-          reply: '抱歉，聊天记录暂时不可用。'
-        });
+        return sendChatError(
+          req,
+          res,
+          503,
+          '聊天记录暂时不可用',
+          'main_session',
+          'main_session_error',
+          '抱歉，聊天记录暂时不可用。'
+        );
       }
 
       console.error('/chat 接口错误');
-      return res.status(502).json({
-        error: '上游服务暂时不可用',
-        reply: '抱歉，我现在有点不在状态，请稍后再试试。'
-      });
+      const activeStage = CHAT_DIAGNOSTIC_STAGE_NAMES.find(
+        name => req.chatDiagnostic?.stages?.[name]?.status === 'running'
+      );
+      return sendChatError(
+        req,
+        res,
+        502,
+        '上游服务暂时不可用',
+        activeStage || 'server',
+        'internal_error',
+        '抱歉，我现在有点不在状态，请稍后再试试。'
+      );
     }
   });
 
   // ---------- 统一错误响应 ----------
-  app.use((error, req, res, next) => {
+  app.use(async (error, req, res, next) => {
     if (error.code === 'CORS_NOT_ALLOWED') {
-      return res.status(403).json({ error: '不允许的跨域来源' });
+      return sendChatError(
+        req, res, 403, '不允许的跨域来源', 'request', 'cors_not_allowed'
+      );
     }
     if (error.type === 'entity.too.large') {
-      return res.status(413).json({ error: '请求内容过大' });
+      return sendChatError(req, res, 413, '请求内容过大', 'request', 'body_too_large');
+    }
+    if (error.type === 'entity.parse.failed') {
+      return sendChatError(req, res, 400, '请求格式无效', 'request', 'invalid_json');
     }
     console.error('未处理的请求错误');
-    return res.status(500).json({ error: '服务器内部错误' });
+    return sendChatError(req, res, 500, '服务器内部错误', 'server', 'internal_error');
   });
 
   return app;
