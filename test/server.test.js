@@ -73,6 +73,15 @@ function diagnosticFixture(overrides = {}) {
       'gateway',
       'message_save'
     ].map(name => [name, { status: 'success', duration_ms: 1 }])),
+    gateway: {
+      round: 7,
+      recent_context_injected: true,
+      recalled_count: 2,
+      diffused_count: 1,
+      injected_count: 3,
+      error_stage: null,
+      error_code: null
+    },
     usage: {
       input_tokens: 100,
       output_tokens: 20,
@@ -906,6 +915,8 @@ test('Gateway 历史在相同 created_at 下按 id 保持多轮正序', async ()
     assert.equal(gatewayCalls[1].options.headers['X-Ombre-Session-Id'], conversationId);
     assert.equal(gatewayCalls[0].payload.stream, false);
     assert.equal(gatewayCalls[0].payload.model, 'test-model');
+    assert.equal(gatewayCalls[0].payload.request_id, first.body.request_id);
+    assert.equal(gatewayCalls[1].payload.request_id, second.body.request_id);
     assert.deepEqual(gatewayCalls[0].payload.messages, [
       { role: 'user', content: '第一轮问题' },
       { role: 'assistant', content: '第一轮回答' },
@@ -1358,20 +1369,36 @@ test('/chat 诊断只保存 Gateway 实际 usage 并记录各阶段', async t =>
       env: baseEnv,
       supabaseClient: supabase,
       requestIdFactory: () => requestId,
-      gatewayFetch: async () => response(200, {
-        choices: [{ message: { content: '带诊断的回复' } }],
-        usage: {
-          prompt_tokens: 321,
-          completion_tokens: 45,
-          total_tokens: 366,
-          prompt_tokens_details: { cached_tokens: 123, secret: '不应保存' },
-          prompt_cache_hit_tokens: 124,
-          prompt_cache_miss_tokens: 197,
-          cache_read_input_tokens: 120,
-          cache_creation_input_tokens: 3,
-          upstream_secret: '不应保存'
-        }
-      })
+      gatewayFetch: async (url, options) => {
+        const payload = JSON.parse(options.body);
+        return response(200, {
+          request_id: payload.request_id,
+          choices: [{ message: { content: '带诊断的回复' } }],
+          diagnostics: {
+            gateway_round: 12,
+            recent_context_injected: true,
+            memory: {
+              recalled_count: 2,
+              diffused_count: 1,
+              injected_count: 3,
+              memory_text: '不应保存'
+            },
+            usage: {
+              input_tokens: 321,
+              output_tokens: 45,
+              total_tokens: 366,
+              cached_tokens: 123,
+              prompt_cache_hit_tokens: 124,
+              prompt_cache_miss_tokens: 197,
+              cache_read_input_tokens: 120,
+              cache_creation_input_tokens: 3,
+              upstream_secret: '不应保存'
+            },
+            prompt: '不应保存'
+          },
+          usage: { prompt_tokens: 999999 }
+        });
+      }
     });
 
     try {
@@ -1393,6 +1420,15 @@ test('/chat 诊断只保存 Gateway 实际 usage 并记录各阶段', async t =>
         cache_read_input_tokens: 120,
         cache_creation_input_tokens: 3
       });
+      assert.deepEqual(result.body.diagnostics.gateway, {
+        round: 12,
+        recent_context_injected: true,
+        recalled_count: 2,
+        diffused_count: 1,
+        injected_count: 3,
+        error_stage: null,
+        error_code: null
+      });
       for (const stage of Object.values(result.body.diagnostics.stages)) {
         assert.equal(stage.status, 'success');
         assert.equal(typeof stage.duration_ms, 'number');
@@ -1412,6 +1448,12 @@ test('/chat 诊断只保存 Gateway 实际 usage 并记录各阶段', async t =>
       const savedMessages = supabase.inserts.find(rows => Array.isArray(rows));
       assert.equal(savedMessages[0].request_id, undefined);
       assert.equal(savedMessages[1].request_id, requestId);
+      assert.equal(supabase.calls.filter(
+        call => call.method === 'insert' && call.table === 'chat_requests'
+      ).length, 1);
+      assert.equal(supabase.calls.filter(
+        call => call.method === 'insert' && call.table === 'messages'
+      ).length, 1);
     } finally {
       await closeServer(server);
     }
@@ -1422,16 +1464,22 @@ test('/chat 诊断只保存 Gateway 实际 usage 并记录各阶段', async t =>
     const server = await startTestServer({
       env: baseEnv,
       supabaseClient: supabase,
-      gatewayFetch: async () => response(200, {
-        choices: [{ message: { content: '部分 usage' } }],
-        usage: {
-          prompt_tokens: 10,
-          completion_tokens: 5,
-          total_tokens: '15',
-          prompt_tokens_details: { cached_tokens: '4' },
-          cache_read_input_tokens: -1
-        }
-      })
+      gatewayFetch: async (url, options) => {
+        const payload = JSON.parse(options.body);
+        return response(200, {
+          request_id: payload.request_id,
+          choices: [{ message: { content: '部分 usage' } }],
+          diagnostics: {
+            usage: {
+              input_tokens: 10,
+              output_tokens: 5,
+              total_tokens: '15',
+              cached_tokens: '4',
+              cache_read_input_tokens: -1
+            }
+          }
+        });
+      }
     });
 
     try {
@@ -1447,6 +1495,83 @@ test('/chat 诊断只保存 Gateway 实际 usage 并记录各阶段', async t =>
       assert.equal(result.body.diagnostics.usage.cache_creation_input_tokens, null);
     } finally {
       await closeServer(server);
+    }
+  });
+
+  await t.test('Gateway request_id 缺失或不匹配时诊断保持 null 且回复成功', async t2 => {
+    for (const mode of ['missing', 'mismatch']) {
+      await t2.test(mode, async () => {
+        const supabase = createFakeSupabase({ existingSessions: [existingSession] });
+        let gatewayCalls = 0;
+        let sentRequestId;
+        const server = await startTestServer({
+          env: baseEnv,
+          supabaseClient: supabase,
+          gatewayFetch: async (url, options) => {
+            gatewayCalls += 1;
+            const payload = JSON.parse(options.body);
+            sentRequestId = payload.request_id;
+            return response(200, {
+              ...(mode === 'mismatch'
+                ? { request_id: '99999999-9999-4999-8999-999999999999' }
+                : {}),
+              choices: [{ message: { content: `${mode} 仍然回复` } }],
+              diagnostics: {
+                gateway_round: 999,
+                recent_context_injected: true,
+                memory: {
+                  recalled_count: 9,
+                  diffused_count: 9,
+                  injected_count: 9
+                },
+                usage: {
+                  input_tokens: 999,
+                  output_tokens: 999,
+                  total_tokens: 1998,
+                  cached_tokens: 999
+                }
+              }
+            });
+          }
+        });
+
+        try {
+          const result = await request(server, '/chat', {
+            method: 'POST',
+            body: { message: `${mode} request id` }
+          });
+          assertSuccessfulChatResponse(result, `${mode} 仍然回复`);
+          assert.equal(sentRequestId, result.body.request_id);
+          assert.equal(gatewayCalls, 1);
+          assert.deepEqual(result.body.diagnostics.gateway, {
+            round: null,
+            recent_context_injected: null,
+            recalled_count: null,
+            diffused_count: null,
+            injected_count: null,
+            error_stage: null,
+            error_code: null
+          });
+          assert.deepEqual(result.body.diagnostics.usage, {
+            input_tokens: null,
+            output_tokens: null,
+            total_tokens: null,
+            cached_tokens: null,
+            prompt_cache_hit_tokens: null,
+            prompt_cache_miss_tokens: null,
+            cache_read_input_tokens: null,
+            cache_creation_input_tokens: null
+          });
+          assert.equal(supabase.calls.filter(
+            call => call.method === 'insert' && call.table === 'chat_requests'
+          ).length, 1);
+          assert.equal(supabase.calls.filter(
+            call => call.method === 'insert' && call.table === 'messages'
+          ).length, 1);
+        } finally {
+          await closeServer(server);
+        }
+      });
     }
   });
 });
@@ -1573,6 +1698,61 @@ test('/chat/history 为成功 assistant 附加脱敏诊断并兼容旧消息', a
   }
 });
 
+test('/chat/history 为旧诊断补充 null Gateway 字段', async () => {
+  const conversationId = 'acacacac-acac-4cac-8cac-acacacacacac';
+  const sessionId = toSupabaseSessionId(conversationId);
+  const requestId = '45454545-4545-4545-8545-454545454545';
+  const oldDiagnostics = diagnosticFixture();
+  delete oldDiagnostics.gateway;
+  const supabase = createFakeSupabase({
+    existingSessions: [{
+      id: sessionId,
+      name: '主聊天',
+      user_id: baseEnv.CHAT_ALLOWED_USER_ID,
+      session_kind: 'main',
+      conversation_id: conversationId
+    }],
+    history: [{
+      id: '1',
+      session_id: sessionId,
+      role: 'ai',
+      content: '旧诊断回复',
+      created_at: '2026-08-15T02:30:00.000Z',
+      visible: true,
+      request_id: requestId
+    }],
+    chatRequests: [{
+      request_id: requestId,
+      session_id: sessionId,
+      status: 'success',
+      diagnostics: oldDiagnostics
+    }]
+  });
+  const server = await startTestServer({
+    env: baseEnv,
+    supabaseClient: supabase,
+    gatewayFetch: async () => response(200, {})
+  });
+
+  try {
+    const result = await request(server, '/chat/history');
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.body.messages[0].diagnostics, diagnosticFixture({
+      gateway: {
+        round: null,
+        recent_context_injected: null,
+        recalled_count: null,
+        diffused_count: null,
+        injected_count: null,
+        error_stage: null,
+        error_code: null
+      }
+    }));
+  } finally {
+    await closeServer(server);
+  }
+});
+
 test('/chat/history 诊断查询失败时仍返回消息正文', async () => {
   const conversationId = 'abababab-abab-4bab-8bab-abababababab';
   const sessionId = toSupabaseSessionId(conversationId);
@@ -1632,7 +1812,16 @@ test('Gateway 非成功响应和无效响应都返回安全错误且不保存消
     const server = await startTestServer({
       env: baseEnv,
       supabaseClient: supabase,
-      gatewayFetch: async () => response(401, { secret: '不应泄露' })
+      gatewayFetch: async (url, options) => {
+        const payload = JSON.parse(options.body);
+        return response(401, {
+          request_id: payload.request_id,
+          error_stage: 'upstream',
+          error_code: 'upstream_error',
+          secret: '不应泄露',
+          prompt: '不应泄露'
+        });
+      }
     });
     try {
       const result = await request(server, '/chat', {
@@ -1650,6 +1839,16 @@ test('Gateway 非成功响应和无效响应都返回安全错误且不保存消
       assert.equal(diagnostic.status, 'error');
       assert.equal(diagnostic.error_stage, 'gateway');
       assert.equal(diagnostic.error_code, 'gateway_unavailable');
+      assert.deepEqual(diagnostic.diagnostics.gateway, {
+        round: null,
+        recent_context_injected: null,
+        recalled_count: null,
+        diffused_count: null,
+        injected_count: null,
+        error_stage: 'upstream',
+        error_code: 'upstream_error'
+      });
+      assert.equal(JSON.stringify(diagnostic).includes('不应泄露'), false);
     } finally {
       console.error = originalError;
       await closeServer(server);

@@ -126,11 +126,86 @@ function normalizeGatewayUsage(data) {
     output_tokens: nonNegativeSafeInteger(usage.completion_tokens)
       ?? nonNegativeSafeInteger(usage.output_tokens),
     total_tokens: nonNegativeSafeInteger(usage.total_tokens),
-    cached_tokens: nonNegativeSafeInteger(promptDetails.cached_tokens),
+    cached_tokens: nonNegativeSafeInteger(promptDetails.cached_tokens)
+      ?? nonNegativeSafeInteger(usage.cached_tokens),
     prompt_cache_hit_tokens: nonNegativeSafeInteger(usage.prompt_cache_hit_tokens),
     prompt_cache_miss_tokens: nonNegativeSafeInteger(usage.prompt_cache_miss_tokens),
     cache_read_input_tokens: nonNegativeSafeInteger(usage.cache_read_input_tokens),
     cache_creation_input_tokens: nonNegativeSafeInteger(usage.cache_creation_input_tokens)
+  };
+}
+
+function normalizeDiagnosticIdentifier(value) {
+  return typeof value === 'string' && /^[a-z][a-z0-9_:-]{0,63}$/.test(value)
+    ? value
+    : null;
+}
+
+function emptyGatewayDiagnostics() {
+  return {
+    round: null,
+    recent_context_injected: null,
+    recalled_count: null,
+    diffused_count: null,
+    injected_count: null,
+    error_stage: null,
+    error_code: null
+  };
+}
+
+function normalizeStoredGatewayDiagnostics(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  return {
+    round: nonNegativeSafeInteger(source.round),
+    recent_context_injected: typeof source.recent_context_injected === 'boolean'
+      ? source.recent_context_injected
+      : null,
+    recalled_count: nonNegativeSafeInteger(source.recalled_count),
+    diffused_count: nonNegativeSafeInteger(source.diffused_count),
+    injected_count: nonNegativeSafeInteger(source.injected_count),
+    error_stage: normalizeDiagnosticIdentifier(source.error_stage),
+    error_code: normalizeDiagnosticIdentifier(source.error_code)
+  };
+}
+
+function normalizeGatewayDiagnostics(data, expectedRequestId, includeError = false) {
+  const empty = {
+    gateway: emptyGatewayDiagnostics(),
+    usage: normalizeGatewayUsage(null)
+  };
+  if (
+    !isUuid(expectedRequestId)
+    || !data
+    || typeof data !== 'object'
+    || Array.isArray(data)
+    || data.request_id !== expectedRequestId
+  ) {
+    return empty;
+  }
+
+  const diagnostics = data.diagnostics
+    && typeof data.diagnostics === 'object'
+    && !Array.isArray(data.diagnostics)
+    ? data.diagnostics
+    : {};
+  const memory = diagnostics.memory
+    && typeof diagnostics.memory === 'object'
+    && !Array.isArray(diagnostics.memory)
+    ? diagnostics.memory
+    : {};
+  return {
+    gateway: {
+      round: nonNegativeSafeInteger(diagnostics.gateway_round),
+      recent_context_injected: typeof diagnostics.recent_context_injected === 'boolean'
+        ? diagnostics.recent_context_injected
+        : null,
+      recalled_count: nonNegativeSafeInteger(memory.recalled_count),
+      diffused_count: nonNegativeSafeInteger(memory.diffused_count),
+      injected_count: nonNegativeSafeInteger(memory.injected_count),
+      error_stage: includeError ? normalizeDiagnosticIdentifier(data.error_stage) : null,
+      error_code: includeError ? normalizeDiagnosticIdentifier(data.error_code) : null
+    },
+    usage: normalizeGatewayUsage({ usage: diagnostics.usage })
   };
 }
 
@@ -166,6 +241,7 @@ function normalizeStoredDiagnostics(value) {
       ? value.total_duration_ms
       : null,
     stages,
+    gateway: normalizeStoredGatewayDiagnostics(value.gateway),
     usage: {
       input_tokens: nonNegativeSafeInteger(usage.input_tokens),
       output_tokens: nonNegativeSafeInteger(usage.output_tokens),
@@ -321,6 +397,7 @@ function createApp(options = {}) {
       status,
       total_duration_ms: totalDurationMs,
       stages: diagnostic.stages,
+      gateway: diagnostic.gateway,
       usage: diagnostic.usage
     });
     diagnostic.publicPayload = publicPayload;
@@ -373,6 +450,7 @@ function createApp(options = {}) {
         started_ms: monotonicNow(),
         session_id: null,
         stages: newDiagnosticStages(),
+        gateway: emptyGatewayDiagnostics(),
         usage: normalizeGatewayUsage(null),
         completed: false,
         publicPayload: null
@@ -902,6 +980,7 @@ function createApp(options = {}) {
           'X-Ombre-Session-Id': session.gatewaySessionId
         },
         body: JSON.stringify({
+          request_id: req.chatDiagnostic.request_id,
           model: config.model,
           messages,
           temperature: 0.7,
@@ -909,6 +988,21 @@ function createApp(options = {}) {
           stream: false
         })
       });
+
+      let data = null;
+      let responseJsonValid = true;
+      try {
+        data = await response.json();
+      } catch {
+        responseJsonValid = false;
+      }
+      const gatewayDiagnostics = normalizeGatewayDiagnostics(
+        data,
+        req.chatDiagnostic.request_id,
+        !response.ok
+      );
+      req.chatDiagnostic.gateway = gatewayDiagnostics.gateway;
+      req.chatDiagnostic.usage = gatewayDiagnostics.usage;
 
       if (!response.ok) {
         finishDiagnosticStage(req, 'gateway', 'failure');
@@ -924,10 +1018,7 @@ function createApp(options = {}) {
         );
       }
 
-      let data;
-      try {
-        data = await response.json();
-      } catch {
+      if (!responseJsonValid) {
         finishDiagnosticStage(req, 'gateway', 'failure');
         console.error('Gateway 返回格式无效');
         return sendChatError(
@@ -940,7 +1031,6 @@ function createApp(options = {}) {
           '抱歉，我现在有点不在状态，请稍后再试试。'
         );
       }
-      req.chatDiagnostic.usage = normalizeGatewayUsage(data);
       const reply = data?.choices?.[0]?.message?.content;
       if (typeof reply !== 'string' || !reply.trim()) {
         finishDiagnosticStage(req, 'gateway', 'failure');
