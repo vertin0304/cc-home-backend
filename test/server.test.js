@@ -13,6 +13,12 @@ const migrationPath = path.join(
   'migrations',
   '20260809_add_owned_main_sessions.sql'
 );
+const securityMigrationPath = path.join(
+  __dirname,
+  '..',
+  'migrations',
+  '20260815_secure_public_tables.sql'
+);
 
 const baseEnv = {
   NODE_ENV: 'production',
@@ -264,6 +270,30 @@ test('所有权 migration 只新增 nullable 元数据且不改写 legacy 行', 
   assert.doesNotMatch(sql, /^\s*update\s+/im);
   assert.doesNotMatch(sql, /^\s*delete\s+from\s+/im);
   assert.doesNotMatch(sql, /^\s*insert\s+into\s+/im);
+});
+
+test('公开表安全 migration 启用 RLS 并只保留 service_role 数据权限', () => {
+  const sql = fs.readFileSync(securityMigrationPath, 'utf8');
+  const tables = ['sessions', 'messages', 'memories', 'settings'];
+
+  for (const table of tables) {
+    assert.match(sql, new RegExp(
+      `alter table if exists public\\.${table} enable row level security`,
+      'i'
+    ));
+    assert.match(sql, new RegExp(
+      `revoke all privileges on table public\\.${table} from public, anon, authenticated`,
+      'i'
+    ));
+    assert.match(sql, new RegExp(
+      `grant select, insert, update, delete on table public\\.${table} to service_role`,
+      'i'
+    ));
+  }
+
+  assert.doesNotMatch(sql, /create\s+policy/i);
+  assert.doesNotMatch(sql, /^\s*(insert\s+into|update|delete\s+from|truncate)\s+/im);
+  assert.doesNotMatch(sql, /^\s*drop\s+(table|index|constraint)\s+/im);
 });
 
 test('/chat 区分 Supabase 用户 JWT 与内部烟测凭证', async t => {
