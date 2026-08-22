@@ -92,6 +92,19 @@ function isUuid(value) {
     && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
+const MODEL_ALIAS_PATTERN = /^cc-home-[a-z0-9][a-z0-9._-]{0,119}$/;
+const MODEL_ALIAS_LABELS = Object.freeze({
+  'cc-home-default': '默认模型',
+  'cc-home-claude-sonnet': 'Claude Sonnet',
+  'cc-home-claude-opus': 'Claude Opus'
+});
+
+function normalizeModelAlias(value) {
+  if (typeof value !== 'string') return null;
+  const alias = value.trim();
+  return MODEL_ALIAS_PATTERN.test(alias) ? alias : null;
+}
+
 const CHAT_DIAGNOSTIC_STAGE_NAMES = [
   'authentication',
   'main_session',
@@ -653,14 +666,108 @@ function createApp(options = {}) {
     };
   }
 
-  function gatewayChatConfig() {
-    const config = gatewayConnectionConfig();
-    if (typeof env.OMBRE_GATEWAY_MODEL !== 'string' || !env.OMBRE_GATEWAY_MODEL.trim()) {
-      const error = new Error('Gateway 模型未配置');
+  function modelSelectionConfig() {
+    const defaultModel = normalizeModelAlias(env.OMBRE_GATEWAY_MODEL);
+    if (!defaultModel) {
+      const error = new Error('Gateway 模型未配置或不是安全别名');
       error.code = 'GATEWAY_CONFIG_ERROR';
       throw error;
     }
-    return { ...config, model: env.OMBRE_GATEWAY_MODEL.trim() };
+
+    const rawAliases = typeof env.CC_HOME_ALLOWED_MODEL_ALIASES === 'string'
+      ? env.CC_HOME_ALLOWED_MODEL_ALIASES.split(',').map(item => item.trim()).filter(Boolean)
+      : [];
+    const invalidAlias = rawAliases.find(alias => !normalizeModelAlias(alias));
+    if (invalidAlias) {
+      const error = new Error('允许模型别名配置无效');
+      error.code = 'GATEWAY_CONFIG_ERROR';
+      throw error;
+    }
+
+    const aliases = [...new Set([defaultModel, ...rawAliases])];
+    return {
+      defaultModel,
+      aliases,
+      models: aliases.map(id => ({ id, label: MODEL_ALIAS_LABELS[id] || id }))
+    };
+  }
+
+  function gatewayChatConfig(modelAlias) {
+    const config = gatewayConnectionConfig();
+    const selection = modelSelectionConfig();
+    const model = modelAlias === undefined
+      ? selection.defaultModel
+      : normalizeModelAlias(modelAlias);
+    if (!model || !selection.aliases.includes(model)) {
+      const error = new Error('Gateway 模型别名不在服务端允许列表中');
+      error.code = 'GATEWAY_CONFIG_ERROR';
+      throw error;
+    }
+    return { ...config, model };
+  }
+
+  async function readModelPreference(userId) {
+    const { data, error } = await supabase
+      .from('chat_preferences')
+      .select('model_alias')
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (error) {
+      const preferenceError = new Error('模型偏好查询失败');
+      preferenceError.code = 'MODEL_PREFERENCE_ERROR';
+      throw preferenceError;
+    }
+    return normalizeModelAlias(data?.model_alias);
+  }
+
+  async function saveModelPreference(userId, modelAlias) {
+    const { error } = await supabase.from('chat_preferences').upsert({
+      user_id: userId,
+      model_alias: modelAlias,
+      updated_at: wallClockNow().toISOString()
+    }, { onConflict: 'user_id' });
+    if (error) {
+      const preferenceError = new Error('模型偏好保存失败');
+      preferenceError.code = 'MODEL_PREFERENCE_ERROR';
+      throw preferenceError;
+    }
+  }
+
+  async function resolveUserModel(userId, { degradeToDefault = false } = {}) {
+    const selection = modelSelectionConfig();
+    try {
+      const storedAlias = await readModelPreference(userId);
+      return storedAlias && selection.aliases.includes(storedAlias)
+        ? storedAlias
+        : selection.defaultModel;
+    } catch (error) {
+      if (!degradeToDefault) throw error;
+      console.error('加载模型偏好失败，使用默认模型');
+      return selection.defaultModel;
+    }
+  }
+
+  async function availableModelOptions() {
+    const selection = modelSelectionConfig();
+    const response = await requestGateway('/models', { method: 'GET' });
+    if (!response.ok) {
+      const listError = new Error('Gateway 模型列表不可用');
+      listError.code = 'GATEWAY_MODEL_LIST_ERROR';
+      throw listError;
+    }
+    const data = await response.json();
+    const gatewayAliases = new Set(
+      Array.isArray(data?.data)
+        ? data.data.map(item => normalizeModelAlias(item?.id)).filter(Boolean)
+        : []
+    );
+    const models = selection.models.filter(model => gatewayAliases.has(model.id));
+    if (!models.some(model => model.id === selection.defaultModel)) {
+      const listError = new Error('默认模型未出现在 Gateway 模型列表中');
+      listError.code = 'GATEWAY_MODEL_LIST_ERROR';
+      throw listError;
+    }
+    return { ...selection, models };
   }
 
   function normalizeMainSessionRow(row, expectedUserId) {
@@ -853,6 +960,71 @@ function createApp(options = {}) {
     });
   });
 
+  // ---------- 用户模型偏好：仅暴露服务端允许的公开别名 ----------
+  app.get('/chat/models', chatRateLimit, requireChatAccess, async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    if (req.chatPrincipal?.type !== 'user') {
+      return res.status(403).json({ error: '内部烟测不能读取用户模型偏好' });
+    }
+
+    try {
+      const selection = await availableModelOptions();
+      const selectedModel = await resolveUserModel(req.chatPrincipal.userId);
+      return res.json({
+        models: selection.models,
+        selected_model: selection.models.some(model => model.id === selectedModel)
+          ? selectedModel
+          : selection.defaultModel,
+        default_model: selection.defaultModel
+      });
+    } catch (error) {
+      if (error.code === 'GATEWAY_CONFIG_ERROR') {
+        console.error('模型选择服务配置错误');
+        return res.status(503).json({ error: '模型选择服务尚未配置' });
+      }
+      if (error.code === 'MODEL_PREFERENCE_ERROR') {
+        console.error('读取模型偏好失败');
+        return res.status(503).json({ error: '模型偏好暂时不可用' });
+      }
+      console.error('获取安全模型列表失败');
+      return res.status(502).json({ error: '模型列表暂时不可用' });
+    }
+  });
+
+  app.put('/chat/preferences/model', chatRateLimit, requireChatAccess, async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    if (req.chatPrincipal?.type !== 'user') {
+      return res.status(403).json({ error: '内部烟测不能修改用户模型偏好' });
+    }
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+      ? req.body
+      : {};
+    if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'model')) {
+      return res.status(400).json({ error: '请求只能包含 model' });
+    }
+
+    try {
+      const requestedModel = normalizeModelAlias(body.model);
+      const selection = await availableModelOptions();
+      if (!requestedModel || !selection.models.some(model => model.id === requestedModel)) {
+        return res.status(400).json({ error: '模型选项无效' });
+      }
+      await saveModelPreference(req.chatPrincipal.userId, requestedModel);
+      return res.json({ selected_model: requestedModel });
+    } catch (error) {
+      if (error.code === 'GATEWAY_CONFIG_ERROR') {
+        console.error('模型选择服务配置错误');
+        return res.status(503).json({ error: '模型选择服务尚未配置' });
+      }
+      if (error.code === 'MODEL_PREFERENCE_ERROR') {
+        console.error('保存模型偏好失败');
+        return res.status(503).json({ error: '模型偏好暂时不可用' });
+      }
+      console.error('验证安全模型列表失败');
+      return res.status(502).json({ error: '模型列表暂时不可用' });
+    }
+  });
+
   // ---------- 聊天历史：只按已验证用户解析 owned main session ----------
   // 客户端不能选择 session；三列所有权元数据均为 NULL 的 legacy 行永不参与查询。
   app.get('/chat/history', chatRateLimit, requireChatAccess, async (req, res) => {
@@ -937,14 +1109,34 @@ function createApp(options = {}) {
         'message_too_long'
       );
     }
+    const unsupportedFields = Object.keys(req.body || {}).filter(key => key !== 'message');
+    if (unsupportedFields.length > 0) {
+      return sendChatError(
+        req,
+        res,
+        400,
+        '聊天请求只能包含 message',
+        'request',
+        'unsupported_chat_fields'
+      );
+    }
 
     try {
-      const config = gatewayChatConfig();
+      // 先验证服务端配置，避免配置错误时触碰会话或消息数据。
+      const modelSelection = modelSelectionConfig();
+      const defaultGatewayConfig = gatewayChatConfig(modelSelection.defaultModel);
 
       startDiagnosticStage(req, 'main_session');
       const session = await resolveRequestSession(req);
       req.chatDiagnostic.session_id = session.databaseId;
       finishDiagnosticStage(req, 'main_session', 'success');
+
+      const selectedModel = req.chatPrincipal?.type === 'user'
+        ? await resolveUserModel(req.chatPrincipal.userId, { degradeToDefault: true })
+        : modelSelection.defaultModel;
+      const config = selectedModel === modelSelection.defaultModel
+        ? defaultGatewayConfig
+        : gatewayChatConfig(selectedModel);
 
       // Supabase 仅保存 CC Home 界面历史；按自增 id 取最近 20 条后恢复正序。
       startDiagnosticStage(req, 'history');
