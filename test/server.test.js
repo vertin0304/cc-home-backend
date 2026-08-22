@@ -25,6 +25,12 @@ const chatRequestsMigrationPath = path.join(
   'migrations',
   '20260815_add_chat_requests.sql'
 );
+const chatPreferencesMigrationPath = path.join(
+  __dirname,
+  '..',
+  'migrations',
+  '20260823_add_chat_preferences.sql'
+);
 
 const baseEnv = {
   NODE_ENV: 'production',
@@ -34,7 +40,8 @@ const baseEnv = {
   CHAT_ALLOWED_USER_ID: '11111111-1111-4111-8111-111111111111',
   OMBRE_GATEWAY_BASE_URL: 'https://gateway.invalid/v1',
   OMBRE_GATEWAY_TOKEN: 'gateway-test-token',
-  OMBRE_GATEWAY_MODEL: 'test-model',
+  OMBRE_GATEWAY_MODEL: 'cc-home-default',
+  CC_HOME_ALLOWED_MODEL_ALIASES: 'cc-home-default,cc-home-claude-sonnet,cc-home-claude-opus',
   OMBRE_GATEWAY_TIMEOUT_MS: '1000',
   CC_HOME_SMOKE_SESSION_ID: 'cc-home-smoke',
   CHAT_RATE_LIMIT_MAX: '100',
@@ -117,6 +124,9 @@ function createFakeSupabase(options = {}) {
   const chatRequests = new Map(
     (options.chatRequests || []).map(item => [String(item.request_id), { ...item }])
   );
+  const chatPreferences = new Map(
+    (options.chatPreferences || []).map(item => [String(item.user_id), { ...item }])
+  );
 
   return {
     calls,
@@ -124,6 +134,7 @@ function createFakeSupabase(options = {}) {
     sessions,
     messages,
     chatRequests,
+    chatPreferences,
     from(table) {
       calls.push({ method: 'from', table });
       const queryState = {
@@ -147,6 +158,19 @@ function createFakeSupabase(options = {}) {
             if (rows.length > 1) {
               return Promise.resolve({ data: null, error: { code: 'PGRST116' } });
             }
+            return Promise.resolve({ data: rows[0] || null, error: null });
+          }
+          return Promise.resolve({ data: rows, error: null });
+        }
+
+        if (table === 'chat_preferences') {
+          if (options.preferenceQueryError) {
+            return Promise.resolve({ data: null, error: options.preferenceQueryError });
+          }
+          let rows = [...chatPreferences.values()].filter(row =>
+            queryState.filters.every(filter => String(row[filter.column]) === String(filter.value))
+          );
+          if (single) {
             return Promise.resolve({ data: rows[0] || null, error: null });
           }
           return Promise.resolve({ data: rows, error: null });
@@ -254,6 +278,17 @@ function createFakeSupabase(options = {}) {
             messages.push(...rows.map(row => ({ ...row })));
           }
           return Promise.resolve({ error: options.insertError || null });
+        },
+        upsert(rows, upsertOptions) {
+          calls.push({ method: 'upsert', table, rows, options: upsertOptions });
+          if (table !== 'chat_preferences') {
+            return Promise.resolve({ error: new Error('unexpected upsert') });
+          }
+          if (options.preferenceUpsertError) {
+            return Promise.resolve({ error: options.preferenceUpsertError });
+          }
+          chatPreferences.set(String(rows.user_id), { ...rows });
+          return Promise.resolve({ error: null });
         }
       };
       return query;
@@ -406,6 +441,261 @@ test('聊天诊断 migration 安全创建服务端表并保留旧消息', () => 
   );
   assert.doesNotMatch(sql, /create\s+policy/i);
   assert.doesNotMatch(sql, /^\s*(update|delete\s+from|truncate)\s+/im);
+});
+
+test('模型偏好 migration 只新增账号级安全表且不改写现有数据', () => {
+  const sql = fs.readFileSync(chatPreferencesMigrationPath, 'utf8');
+
+  assert.match(sql, /create table public\.chat_preferences/i);
+  assert.match(sql, /user_id uuid primary key references auth\.users\(id\) on delete cascade/i);
+  assert.match(sql, /model_alias text not null/i);
+  assert.match(sql, /chat_preferences_model_alias_check/i);
+  assert.match(sql, /\^cc-home-/i);
+  assert.match(sql, /alter table public\.chat_preferences enable row level security/i);
+  assert.match(
+    sql,
+    /revoke all privileges on table public\.chat_preferences from public, anon, authenticated/i
+  );
+  assert.match(
+    sql,
+    /grant select, insert, update, delete on table public\.chat_preferences to service_role/i
+  );
+  assert.doesNotMatch(sql, /create\s+policy/i);
+  assert.doesNotMatch(sql, /^\s*(update|delete\s+from|truncate|insert\s+into)\s+/im);
+});
+
+test('账号模型接口只暴露允许且可用的公开别名，并跨请求保存选择', async () => {
+  const supabase = createFakeSupabase();
+  let gatewayCalls = 0;
+  const server = await startTestServer({
+    env: baseEnv,
+    supabaseClient: supabase,
+    gatewayFetch: async (url, options) => {
+      gatewayCalls += 1;
+      assert.equal(url, 'https://gateway.invalid/v1/models');
+      assert.equal(options.method, 'GET');
+      return response(200, {
+        data: [
+          { id: 'cc-home-default', provider_url: '不应返回' },
+          { id: 'cc-home-claude-sonnet', upstream_model: '不应返回' },
+          { id: 'not-allowed', api_key: '不应返回' }
+        ]
+      });
+    }
+  });
+
+  try {
+    const before = await request(server, '/chat/models');
+    assert.equal(before.status, 200);
+    assert.deepEqual(before.body, {
+      models: [
+        { id: 'cc-home-default', label: '默认模型' },
+        { id: 'cc-home-claude-sonnet', label: 'Claude Sonnet' }
+      ],
+      selected_model: 'cc-home-default',
+      default_model: 'cc-home-default'
+    });
+    assert.doesNotMatch(JSON.stringify(before.body), /provider_url|upstream_model|api_key|not-allowed/);
+
+    const saved = await request(server, '/chat/preferences/model', {
+      method: 'PUT',
+      body: { model: 'cc-home-claude-sonnet' }
+    });
+    assert.equal(saved.status, 200);
+    assert.deepEqual(saved.body, { selected_model: 'cc-home-claude-sonnet' });
+    const upsert = supabase.calls.find(call => call.method === 'upsert');
+    assert.equal(upsert.options.onConflict, 'user_id');
+    assert.equal(upsert.rows.user_id, baseEnv.CHAT_ALLOWED_USER_ID);
+    assert.equal(upsert.rows.model_alias, 'cc-home-claude-sonnet');
+
+    const after = await request(server, '/chat/models');
+    assert.equal(after.body.selected_model, 'cc-home-claude-sonnet');
+    assert.equal(gatewayCalls, 3);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test('模型偏好接口拒绝任意配置、不可用别名和内部烟测凭证', async () => {
+  const supabase = createFakeSupabase();
+  const server = await startTestServer({
+    env: baseEnv,
+    supabaseClient: supabase,
+    gatewayFetch: async () => response(200, {
+      data: [{ id: 'cc-home-default' }, { id: 'cc-home-claude-sonnet' }]
+    })
+  });
+
+  try {
+    const unsafe = await request(server, '/chat/preferences/model', {
+      method: 'PUT',
+      body: { model: 'cc-home-claude-sonnet', api_key: 'browser-secret', base_url: 'https://evil.invalid' }
+    });
+    assert.equal(unsafe.status, 400);
+
+    const unavailable = await request(server, '/chat/preferences/model', {
+      method: 'PUT',
+      body: { model: 'cc-home-claude-opus' }
+    });
+    assert.equal(unavailable.status, 400);
+    assert.equal(supabase.calls.some(call => call.method === 'upsert'), false);
+
+    const internal = await request(server, '/chat/models', {
+      headers: { 'X-CC-Home-Internal-Token': baseEnv.CHAT_ACCESS_TOKEN }
+    });
+    assert.equal(internal.status, 403);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test('模型偏好接口以安全响应处理 Gateway、配置和数据库失败', async t => {
+  await t.test('Gateway 列表失败不泄露上游内容', async () => {
+    const supabase = createFakeSupabase();
+    const originalError = console.error;
+    console.error = () => {};
+    const server = await startTestServer({
+      env: baseEnv,
+      supabaseClient: supabase,
+      gatewayFetch: async () => response(500, { secret: 'gateway detail' })
+    });
+    try {
+      const result = await request(server, '/chat/models');
+      assert.equal(result.status, 502);
+      assert.deepEqual(result.body, { error: '模型列表暂时不可用' });
+      assert.doesNotMatch(JSON.stringify(result.body), /gateway detail|secret/);
+    } finally {
+      console.error = originalError;
+      await closeServer(server);
+    }
+  });
+
+  await t.test('偏好读取和保存失败均不泄露数据库详情', async () => {
+    const originalError = console.error;
+    console.error = () => {};
+    const readServer = await startTestServer({
+      env: baseEnv,
+      supabaseClient: createFakeSupabase({ preferenceQueryError: new Error('private db detail') }),
+      gatewayFetch: async () => response(200, { data: [{ id: 'cc-home-default' }] })
+    });
+    try {
+      const result = await request(readServer, '/chat/models');
+      assert.equal(result.status, 503);
+      assert.deepEqual(result.body, { error: '模型偏好暂时不可用' });
+      assert.doesNotMatch(JSON.stringify(result.body), /private db detail/);
+    } finally {
+      await closeServer(readServer);
+    }
+
+    const writeServer = await startTestServer({
+      env: baseEnv,
+      supabaseClient: createFakeSupabase({ preferenceUpsertError: new Error('private write detail') }),
+      gatewayFetch: async () => response(200, {
+        data: [{ id: 'cc-home-default' }, { id: 'cc-home-claude-sonnet' }]
+      })
+    });
+    try {
+      const result = await request(writeServer, '/chat/preferences/model', {
+        method: 'PUT',
+        body: { model: 'cc-home-claude-sonnet' }
+      });
+      assert.equal(result.status, 503);
+      assert.deepEqual(result.body, { error: '模型偏好暂时不可用' });
+      assert.doesNotMatch(JSON.stringify(result.body), /private write detail/);
+    } finally {
+      console.error = originalError;
+      await closeServer(writeServer);
+    }
+  });
+
+  await t.test('真实上游模型名不能作为公开默认值', async () => {
+    const supabase = createFakeSupabase();
+    const originalError = console.error;
+    console.error = () => {};
+    const server = await startTestServer({
+      env: { ...baseEnv, OMBRE_GATEWAY_MODEL: 'anthropic/real-model' },
+      supabaseClient: supabase,
+      gatewayFetch: async () => response(200, { data: [] })
+    });
+    try {
+      const result = await request(server, '/chat/models');
+      assert.equal(result.status, 503);
+      assert.equal(supabase.calls.length, 0);
+    } finally {
+      console.error = originalError;
+      await closeServer(server);
+    }
+  });
+});
+
+test('/chat 从账号偏好选择公开模型，异常或失效偏好安全回退默认值', async t => {
+  for (const scenario of [
+    { name: '有效偏好', preference: 'cc-home-claude-sonnet', expected: 'cc-home-claude-sonnet' },
+    { name: '已移除偏好', preference: 'cc-home-removed', expected: 'cc-home-default' },
+    { name: '偏好读取失败', preferenceError: new Error('database detail'), expected: 'cc-home-default' }
+  ]) {
+    await t.test(scenario.name, async () => {
+      const supabase = createFakeSupabase({
+        chatPreferences: scenario.preference
+          ? [{ user_id: baseEnv.CHAT_ALLOWED_USER_ID, model_alias: scenario.preference }]
+          : [],
+        preferenceQueryError: scenario.preferenceError
+      });
+      let sentModel;
+      const originalError = console.error;
+      console.error = () => {};
+      const server = await startTestServer({
+        env: baseEnv,
+        supabaseClient: supabase,
+        gatewayFetch: async (url, options) => {
+          sentModel = JSON.parse(options.body).model;
+          return response(200, { choices: [{ message: { content: 'ok' } }] });
+        }
+      });
+      try {
+        const result = await request(server, '/chat', {
+          method: 'POST',
+          body: { message: '测试选择' }
+        });
+        assertSuccessfulChatResponse(result, 'ok');
+        assert.equal(sentModel, scenario.expected);
+      } finally {
+        console.error = originalError;
+        await closeServer(server);
+      }
+    });
+  }
+});
+
+test('/chat 不接受客户端模型、URL 或密钥字段且不会调用 Gateway', async () => {
+  const supabase = createFakeSupabase();
+  let gatewayCalls = 0;
+  const server = await startTestServer({
+    env: baseEnv,
+    supabaseClient: supabase,
+    gatewayFetch: async () => {
+      gatewayCalls += 1;
+      return response(200, { choices: [{ message: { content: '不应到达' } }] });
+    }
+  });
+
+  try {
+    for (const extra of [
+      { model: 'cc-home-claude-sonnet' },
+      { base_url: 'https://evil.invalid' },
+      { api_key: 'browser-secret' }
+    ]) {
+      const result = await request(server, '/chat', {
+        method: 'POST',
+        body: { message: '测试', ...extra }
+      });
+      assert.equal(result.status, 400);
+      assert.equal(result.body.error_code, 'unsupported_chat_fields');
+    }
+    assert.equal(gatewayCalls, 0);
+  } finally {
+    await closeServer(server);
+  }
 });
 
 test('/chat 区分 Supabase 用户 JWT 与内部烟测凭证', async t => {
@@ -914,7 +1204,7 @@ test('Gateway 历史在相同 created_at 下按 id 保持多轮正序', async ()
     assert.equal(gatewayCalls[0].options.headers['X-Ombre-Session-Id'], conversationId);
     assert.equal(gatewayCalls[1].options.headers['X-Ombre-Session-Id'], conversationId);
     assert.equal(gatewayCalls[0].payload.stream, false);
-    assert.equal(gatewayCalls[0].payload.model, 'test-model');
+    assert.equal(gatewayCalls[0].payload.model, 'cc-home-default');
     assert.equal(gatewayCalls[0].payload.request_id, first.body.request_id);
     assert.equal(gatewayCalls[1].payload.request_id, second.body.request_id);
     assert.deepEqual(gatewayCalls[0].payload.messages, [

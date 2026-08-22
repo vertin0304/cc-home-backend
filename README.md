@@ -22,6 +22,18 @@ Gateway session。客户端提交 `sessionId` 会被拒绝，也不会收到服�
 内部烟测使用 `CC_HOME_SMOKE_SESSION_ID`，不读取或保存 Supabase 用户消息；内部凭证不能
 访问历史接口，因此烟测数据与用户主聊天完全隔离。
 
+## 账号模型偏好
+
+`GET /chat/models` 与 `PUT /chat/preferences/model` 只接受 Supabase 用户 JWT。前者只返回
+`CC_HOME_ALLOWED_MODEL_ALIASES` 中、且 Haven `/models` 当前实际提供的安全公开别名；后者
+只接受 `{ "model": "<公开别名>" }`。供应商 URL、密钥和真实上游模型名不会返回浏览器。
+公开别名统一以 `cc-home-` 开头，服务端默认模型也必须使用这类 Haven 别名。
+
+迁移 `migrations/20260823_add_chat_preferences.sql` 创建仅供 service role 使用的
+`chat_preferences` 表。偏好按 Supabase `user_id` 保存，因此同一账号可跨浏览器和设备共享；
+没有偏好、旧值已从允许列表移除或聊天时偏好读取暂时失败时，继续使用
+`OMBRE_GATEWAY_MODEL`。`POST /chat` 仍只接受 `{ "message": "..." }`，客户端不能逐轮指定模型。
+
 ## 聊天历史
 
 `GET /chat/history` 根据已验证用户解析主聊天，并复用 UUID 到 PostgreSQL bigint 的
